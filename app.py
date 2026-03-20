@@ -20,10 +20,12 @@ Bem-vindo! Sou um agente especialista na movimentação de cargas do porto.
 Você pode me perguntar sobre **Market Share, Crescimento, Mix de Cargas e Volumes (TEUs)** dos terminais.
 """)
 
-# 1. Inicializa o Agente Coordenador apenas uma vez por sessão
-if "coordinator" not in st.session_state:
-    with st.spinner("Inicializando agentes e carregando banco de dados da APS..."):
-        st.session_state.coordinator = CoordinatorAgent()
+# 1. NOVO: Inicializa o Agente com cache global (Evita o erro de Timeout!)
+@st.cache_resource(show_spinner="Carregando banco de dados da APS (Isso leva cerca de 1 minuto na primeira vez)...")
+def iniciar_agente():
+    return CoordinatorAgent()
+
+coordinator = iniciar_agente()
 
 # 2. Inicializa o histórico de mensagens para a interface visual
 if "messages" not in st.session_state:
@@ -48,8 +50,8 @@ if user_input := st.chat_input("Ex: Qual o market share do porto em 2026?"):
     # Exibe a resposta do assistente com um indicador de carregamento
     with st.chat_message("assistant"):
         with st.spinner("Analisando dados ..."):
-            # Chama o nosso fluxo multiagente
-            resposta_agente = st.session_state.coordinator.chat(user_input)
+            # Chama o nosso fluxo multiagente (agora usando a variável 'coordinator')
+            resposta_agente = coordinator.chat(user_input)
             st.markdown(resposta_agente)
             
             # --- LÓGICA DE CAPTURA DO GRÁFICO ---
