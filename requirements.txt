@@ -8,6 +8,5 @@ langchain-community
 chromadb 
 pypdf 
 tiktoken
-streamlit
+streamlit>=1.38.0
 matplotlib
-altair==4.2.2
