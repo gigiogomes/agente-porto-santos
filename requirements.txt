@@ -10,3 +10,4 @@ pypdf
 tiktoken
 streamlit
 matplotlib
+altair==4.2.2
