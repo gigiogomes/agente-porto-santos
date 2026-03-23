@@ -9,7 +9,7 @@ import base64
 # Configurações de URL e Caminho Local
 URL_MENSARIO = "http://mensario.portodesantos.com.br/exportarcargas/csv"
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LOCAL_CSV_PATH = LOCAL_CSV_PATH = "https://github.com/gigiogomes/agente-porto-santos/releases/download/v1.0/exportacao_cargas.csv"
+LOCAL_CSV_PATH = "https://github.com/gigiogomes/agente-porto-santos/releases/download/v1.0/exportacao_cargas.csv"
 
 # Mapeamento para que o agente entenda as siglas
 TERMINAL_MAPPING = {
