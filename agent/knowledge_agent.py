@@ -1,99 +1,181 @@
 import os
-import sys
+import json
+import hashlib
+from pathlib import Path
 from dotenv import load_dotenv
 
-# Bibliotecas do LangChain para o RAG
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.document_loaders import DirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_classic.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
 
-# Garante que as variáveis do .env (como OPENAI_API_KEY) sejam carregadas
 load_dotenv()
+
 
 class KnowledgeAgent:
     def __init__(self, docs_dir="docs", persist_dir="chroma_db"):
         print("Iniciando Agente de Conhecimento (RAG)...")
+
         self.docs_dir = docs_dir
         self.persist_dir = persist_dir
-        
-        # 1. Configura o modelo de Embeddings e o LLM
+        self.meta_path = os.path.join(self.persist_dir, "_index_meta.json")
+
+        self.ready = False
+        self.status_message = "Não inicializado"
+
         self.embeddings = OpenAIEmbeddings(api_key=os.getenv("OPENAI_API_KEY"))
         self.llm = ChatOpenAI(model="gpt-4o", temperature=0)
-        
-        # 2. Inicializa ou carrega o banco de dados vetorial
+
         self.vector_store = self._init_or_load_db()
-        
-        # 3. Configura o "Retriever" (buscador) para trazer os 3 trechos mais relevantes
-        retriever = self.vector_store.as_retriever(search_kwargs={"k": 3})
-        
-        # 4. Prompt de Sistema do RAG
-        # 4. Prompt de Sistema do RAG
+
+        if self.vector_store is None:
+            self.status_message = "Sem documentos válidos para indexação."
+            return
+
+        retriever = self.vector_store.as_retriever(search_kwargs={"k": 4})
+
         system_prompt = (
             "Você é o Agente de Conhecimento do Porto de Santos. "
-            "Sua missão é responder a perguntas qualitativas usando APENAS o contexto fornecido abaixo.\n"
-            "O ano atual é 2026. Trate documentos e eventos de 2025 e 2026 como fatos presentes ou passados, não como previsões futuras.\n\n"
-            "Se a resposta não estiver no contexto, diga claramente que não encontrou a informação nos documentos oficiais.\n\n"
+            "Responda perguntas qualitativas usando apenas o contexto recuperado. "
+            "Se a resposta não estiver nos documentos, diga isso claramente.\n\n"
             "Contexto recuperado:\n{context}"
         )
+
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_prompt),
-            ("human", "{input}"),
+            ("human", "{input}")
         ])
-        
-        # 5. Monta a corrente (Chain) que junta a busca com o LLM
+
         question_answer_chain = create_stuff_documents_chain(self.llm, prompt)
         self.rag_chain = create_retrieval_chain(retriever, question_answer_chain)
 
+        self.ready = True
+        self.status_message = "Operacional"
+
+    def _build_docs_fingerprint(self) -> str:
+        docs_path = Path(self.docs_dir)
+
+        if not docs_path.exists():
+            return ""
+
+        parts = []
+        for file in sorted(docs_path.rglob("*")):
+            if file.is_file():
+                stat = file.stat()
+                parts.append(f"{file.name}|{stat.st_size}|{int(stat.st_mtime)}")
+
+        if not parts:
+            return ""
+
+        return hashlib.sha256("||".join(parts).encode("utf-8")).hexdigest()
+
+    def _read_saved_fingerprint(self) -> str:
+        if not os.path.exists(self.meta_path):
+            return ""
+
+        try:
+            with open(self.meta_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("fingerprint", "")
+        except Exception:
+            return ""
+
+    def _save_fingerprint(self, fingerprint: str):
+        os.makedirs(self.persist_dir, exist_ok=True)
+
+        with open(self.meta_path, "w", encoding="utf-8") as f:
+            json.dump({"fingerprint": fingerprint}, f, ensure_ascii=False, indent=2)
+
     def _init_or_load_db(self):
-        """Cria o banco vetorial a partir dos PDFs/Textos ou carrega um existente."""
-        
-        # Se a pasta do banco já existe, apenas carrega (para ser rápido)
-        if os.path.exists(self.persist_dir):
-            print("✅ Carregando banco de dados vetorial existente...")
-            return Chroma(persist_directory=self.persist_dir, embedding_function=self.embeddings)
-        
-        # Se não existe, lê os documentos na pasta 'docs'
-        print("⚙️ Lendo documentos e gerando embeddings pela primeira vez...")
-        
-        # O DirectoryLoader vai procurar PDFs, TXTs, etc.
-        loader = DirectoryLoader(self.docs_dir, glob="**/*.*", show_progress=True)
-        docs = loader.load()
-        
-        if not docs:
-            print("⚠️ Nenhum documento encontrado na pasta 'docs'.")
-            # Retorna um banco vazio
-            return Chroma(embedding_function=self.embeddings, persist_directory=self.persist_dir)
+        if not os.path.exists(self.docs_dir):
+            print("⚠️ Pasta de documentos não encontrada.")
+            return None
 
-        # Picota o texto em pedaços (chunks) de 1000 caracteres
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        splits = text_splitter.split_documents(docs)
-        
-        # Converte para vetores e salva no disco
-        vector_store = Chroma.from_documents(
-            documents=splits, 
-            embedding=self.embeddings, 
-            persist_directory=self.persist_dir
+        fingerprint = self._build_docs_fingerprint()
+
+        if not fingerprint:
+            print("⚠️ Nenhum documento encontrado para indexação.")
+            return None
+
+        should_rebuild = (
+            (not os.path.exists(self.persist_dir))
+            or (self._read_saved_fingerprint() != fingerprint)
         )
-        print("✅ Banco de dados vetorial criado com sucesso!")
-        return vector_store
 
-    def ask(self, question: str) -> str:
-        """Busca a resposta nos documentos."""
-        response = self.rag_chain.invoke({"input": question})
-        return response["answer"]
+        if should_rebuild:
+            print("⚙️ Reindexando documentos do knowledge agent...")
 
-# ==========================================
-# TESTE DO RAG ISOLADO
-# ==========================================
+            try:
+                loader = DirectoryLoader(
+                    self.docs_dir,
+                    glob="**/*.*",
+                    show_progress=True
+                )
+                docs = loader.load()
+            except Exception as e:
+                print(f"❌ Erro ao carregar documentos: {e}")
+                return None
+
+            if not docs:
+                print("⚠️ Nenhum documento válido carregado.")
+                return None
+
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=200
+            )
+            splits = splitter.split_documents(docs)
+
+            try:
+                vector_store = Chroma.from_documents(
+                    documents=splits,
+                    embedding=self.embeddings,
+                    persist_directory=self.persist_dir
+                )
+                self._save_fingerprint(fingerprint)
+                print("✅ Índice vetorial recriado com sucesso.")
+                return vector_store
+            except Exception as e:
+                print(f"❌ Erro ao criar índice vetorial: {e}")
+                return None
+
+        print("✅ Carregando índice vetorial existente...")
+
+        try:
+            return Chroma(
+                persist_directory=self.persist_dir,
+                embedding_function=self.embeddings
+            )
+        except Exception as e:
+            print(f"❌ Erro ao carregar índice vetorial existente: {e}")
+            return None
+
+    def ask(self, question: str, context: str = "") -> str:
+        if not self.ready:
+            return f"Knowledge agent indisponível. Status: {self.status_message}"
+
+        full_question = question
+        if context:
+            full_question = (
+                f"Contexto recente:\n{context}\n\n"
+                f"Pergunta atual:\n{question}"
+            )
+
+        try:
+            response = self.rag_chain.invoke({"input": full_question})
+            return response.get("answer", "Não foi possível gerar uma resposta.")
+        except Exception as e:
+            return f"Erro ao consultar o knowledge agent: {str(e)}"
+
+
 if __name__ == "__main__":
     agente_rag = KnowledgeAgent()
-    
-    pergunta = "Quais são os planos de investimento e expansão para o porto de santos?"
+
+    pergunta = "Quais são os planos de investimento e expansão para o Porto de Santos?"
     print(f"\nUsuário: {pergunta}")
-    
+
     resposta = agente_rag.ask(pergunta)
     print(f"\nAgente RAG: {resposta}")

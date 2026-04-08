@@ -1,3 +1,50 @@
+# Ambiente e segredos
 .env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# Build / empacotamento
+build/
+dist/
+*.egg-info/
+
+# Jupyter / caches
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Banco vetorial / artefatos locais
+chroma_db/
+temp_graphs/
+*.sqlite
+*.db
+
+# Dados locais e backups
+data/
+backup/
+*.parquet
+*.feather
+*.pkl
+exportacao_cargas.csv
+
+# Logs
+*.log
+
+# Sistema operacional / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
 *.csv
