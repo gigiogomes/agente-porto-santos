@@ -25,18 +25,9 @@ Bem-vindo! Sou um agente especialista na movimentação de cargas do porto.
 Você pode me perguntar sobre **Market Share, Crescimento, Mix de Cargas, Volumes (TEUs)** e também sobre temas qualitativos, caso o knowledge agent esteja carregado.
 """)
 
-
-def init_session_state():
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
-    if "coordinator" not in st.session_state:
-        with st.spinner("Inicializando agentes e carregando base de dados..."):
-            st.session_state.coordinator = CoordinatorAgent()
-
-
-def rebuild_coordinator(clear_messages: bool = False):
-    with st.spinner("Recarregando agentes e base de dados..."):
+# 1. Inicializa o Agente Coordenador apenas uma vez por sessão
+if "coordinator" not in st.session_state:
+    with st.spinner("Inicializando agentes e carregando banco de dados da APS..."):
         st.session_state.coordinator = CoordinatorAgent()
 
     if clear_messages:
@@ -107,25 +98,16 @@ def process_user_message(user_input: str):
     })
 
     with st.chat_message("assistant"):
-        before_files = list_chart_files()
-
-        with st.spinner("Analisando..."):
-            try:
-                resposta_agente = coordinator.chat(user_input)
-            except Exception as e:
-                resposta_agente = (
-                    "Ocorreu um erro ao processar a sua solicitação.\n\n"
-                    f"Detalhe técnico: {str(e)}"
-                )
-
-        st.markdown(resposta_agente)
-
-        image_bytes = None
-        chart_path = find_new_chart(before_files)
-
-        if chart_path and os.path.exists(chart_path):
-            try:
-                with open(chart_path, "rb") as f:
+        with st.spinner("Analisando dados ..."):
+            # Chama o nosso fluxo multiagente
+            resposta_agente = st.session_state.coordinator.chat(user_input)
+            st.markdown(resposta_agente)
+            
+            # --- LÓGICA DE CAPTURA DO GRÁFICO ---
+            image_bytes = None
+            if os.path.exists("grafico_temp.png"):
+                # Lê a imagem para a memória antes de a apagar
+                with open("grafico_temp.png", "rb") as f:
                     image_bytes = f.read()
 
                 st.image(image_bytes)
@@ -141,19 +123,5 @@ def process_user_message(user_input: str):
     st.session_state.messages.append({
         "role": "assistant",
         "content": resposta_agente,
-        "image": image_bytes
+        "image": image_bytes  # Guarda a imagem na memória da sessão
     })
-
-
-def main():
-    init_session_state()
-    render_sidebar()
-    render_chat_history()
-
-    user_input = st.chat_input("Ex: Qual o market share por terminal em 2025?")
-    if user_input:
-        process_user_message(user_input)
-
-
-if __name__ == "__main__":
-    main()
