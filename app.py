@@ -20,6 +20,16 @@ st.set_page_config(
     layout="centered",
 )
 
+# ==========================================
+# 1. A MÁGICA DO CACHE ACONTECE AQUI
+# ==========================================
+@st.cache_resource
+def get_global_coordinator():
+    # Usamos um ID fixo para o agente. Assim o servidor cria a base pesada UMA única vez
+    # e a reaproveita, evitando estourar a memória a cada F5 (refresh) na página.
+    return CoordinatorAgent(session_id="sessao_global_porto")
+
+
 st.title("🚢 Assistente de IA - Porto de Santos")
 st.markdown(
     """
@@ -37,21 +47,19 @@ def init_session_state() -> None:
         st.session_state.messages = []
 
     if "coordinator" not in st.session_state:
-        with st.spinner("Inicializando agentes e carregando base de dados..."):
-            st.session_state.coordinator = CoordinatorAgent(session_id=st.session_state.session_id)
+        with st.spinner("Inicializando agentes e carregando base de dados (Isso ocorre apenas uma vez)..."):
+            # 2. Chamamos o agente blindado pelo cache
+            st.session_state.coordinator = get_global_coordinator()
 
 def rebuild_coordinator(clear_messages: bool = False) -> None:
     with st.spinner("Recarregando agentes e base de dados..."):
-        st.session_state.coordinator = CoordinatorAgent(session_id=st.session_state.session_id)
-
-        st.cache_data.clear()      # Limpa o cache do Pandas (CSV)
-        st.cache_resource.clear()  # Limpa o cache do BD Vetorial (RAG), se houver
-        
-        st.session_state.coordinator = CoordinatorAgent(session_id=st.session_state.session_id)
-        if clear_messages:
-            st.session_state.messages = []
+        if not clear_messages:
+            # Se for recarregar o banco de dados/agentes (botão 🔄)
+            get_global_coordinator.clear() # Limpa a memória do servidor
+            st.session_state.coordinator = get_global_coordinator()
 
     if clear_messages:
+        # Se for apenas limpar o chat (botão 🧹)
         st.session_state.messages = []
         try:
             st.session_state.coordinator.reset_memory()
@@ -87,14 +95,12 @@ def render_sidebar() -> None:
         st.sidebar.error(f"Erro ao obter status do knowledge agent: {exc}")
 
 
-
 def render_chat_history() -> None:
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             if message.get("image"):
                 st.image(message["image"])
-
 
 
 def _read_generated_chart_bytes(chart_path: Optional[str]) -> Optional[bytes]:
@@ -115,7 +121,6 @@ def _read_generated_chart_bytes(chart_path: Optional[str]) -> Optional[bytes]:
             os.remove(chart_path)
         except OSError:
             pass
-
 
 
 def process_user_message(user_input: str) -> None:
@@ -152,7 +157,6 @@ def process_user_message(user_input: str) -> None:
             "image": image_bytes,
         }
     )
-
 
 
 def main() -> None:

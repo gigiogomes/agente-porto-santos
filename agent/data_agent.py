@@ -5,8 +5,7 @@ from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
 
-# --- CORREÇÃO DE ROTAS (IMPORT RESOLVIDO) ---
-# Pega a pasta atual do script (ex: port_agent_g/agent)
+# ROTAS
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Pega a pasta raiz do projeto (ex: port_agent_g)
 ROOT_DIR = os.path.dirname(BASE_DIR)
