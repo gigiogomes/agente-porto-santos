@@ -16,4 +16,6 @@ pypdf>=4.0.0
 unstructured>=0.14.0
 protobuf==3.20.3
 
+numpy==1.26.4
+
 https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1.tar.gz
