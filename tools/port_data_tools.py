@@ -1,39 +1,46 @@
 import os
-import uuid
+import time
 import unicodedata
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from io import StringIO
-from typing import Optional, List, Tuple
+from typing import Dict, List, Optional, Tuple
+import streamlit as st
 
-import matplotlib.pyplot as plt
 import pandas as pd
+import numpy as np
 import requests
-
 
 URL_MENSARIO = "http://mensario.portodesantos.com.br/exportarcargas/csv"
 BACKUP_CSV_URL = "https://github.com/gigiogomes/agente-porto-santos/releases/download/v1.0/exportacao_cargas.csv"
-
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TEMP_GRAPH_DIR = os.path.join(BASE_DIR, "temp_graphs")
-os.makedirs(TEMP_GRAPH_DIR, exist_ok=True)
 
 TERMINAL_MAPPING = {
     "SBSA": "Santos Brasil",
     "DPW": "DP World",
     "BTP": "Brasil Terminal Portuário",
     "ECOPORTO": "Ecoporto Santos",
-    "BTE": "BTE - Base de Transporte e Exportação"
+    "BTE": "BTE - Base de Transporte e Exportação",
+    "TEV": "TEV",
+    "MARIMEX": "Marimex",
+    "TERMARES": "Termares",
+    "TRANSBRASA": "Transbrasa",
+    "LOCALFRIO": "Localfrio",
+    "BANDEIRANTES-DEICMAR": "Bandeirantes-Deicmar",
 }
 
 TERMINAL_ALIASES = {
     "SBSA": ["SBSA", "SANTOS BRASIL", "SANTOS BRASIL PARTICIPACOES"],
     "DPW": ["DPW", "DP WORLD", "DPWORLD", "EMBRAPORT"],
-    "BTP": ["BTP", "BRASIL TERMINAL PORTUARIO", "BRASIL TERMINAL PORTUÁRIO"],
+    "BTP": ["BTP", "BRASIL TERMINAL PORTUARIO"],
     "ECOPORTO": ["ECOPORTO", "ECOPORTO SANTOS"],
-    "BTE": ["BTE", "BASE DE TRANSPORTE E EXPORTACAO", "BASE DE TRANSPORTE E EXPORTAÇÃO"],
+    "BTE": ["BTE", "BASE DE TRANSPORTE E EXPORTACAO"],
+    "TEV": ["TEV"],
+    "MARIMEX": ["MARIMEX"],
+    "TERMARES": ["TERMARES"],
+    "TRANSBRASA": ["TRANSBRASA"],
+    "LOCALFRIO": ["LOCALFRIO"],
+    "BANDEIRANTES-DEICMAR": ["BANDEIRANTES-DEICMAR", "DEICMAR"],
 }
-
 
 @dataclass
 class DataCoverage:
@@ -44,493 +51,238 @@ class DataCoverage:
     max_month: int
     row_count: int
     loaded_at: str
-
+    cargo_mix_list: list
 
 def _normalize_text(value: str) -> str:
-    if value is None:
+    if pd.isna(value) or value is None:
         return ""
     value = str(value).strip().upper()
     value = unicodedata.normalize("NFKD", value).encode("ASCII", "ignore").decode("ASCII")
     return " ".join(value.split())
 
+def _read_csv_from_url(url: str, timeout: int = 30, retries: int = 2) -> pd.DataFrame:
+    for attempt in range(retries + 1):
+        try:
+            response = requests.get(url, timeout=timeout, headers={"Cache-Control": "no-cache"})
+            response.raise_for_status()
+            return pd.read_csv(StringIO(response.text), sep=",", encoding="utf-8")
+        except Exception as exc:
+            if attempt == retries:
+                raise RuntimeError(f"Falha ao ler CSV de {url}: {exc}")
+            time.sleep(1.0)
 
-def _read_csv_from_url(url: str, timeout: int = 20) -> pd.DataFrame:
-    response = requests.get(
-        url,
-        timeout=timeout,
-        headers={"Cache-Control": "no-cache"}
-    )
-    response.raise_for_status()
-    return pd.read_csv(StringIO(response.text), sep=",", encoding="utf-8")
-
-
-def _apply_business_rules(df: pd.DataFrame) -> pd.DataFrame:
-    print(f"🔍 [DEBUG] Colunas encontradas no CSV: {list(df.columns)}")
-
-    if "NATUREZA_CARGA" in df.columns:
-        linhas_antes = len(df)
-        df = df[df["NATUREZA_CARGA"] == "CARGA CONTEINERIZADA"].copy()
-        linhas_depois = len(df)
-        print(
-            f"✅ Filtro de Carga Conteinerizada aplicado: "
-            f"de {linhas_antes} para {linhas_depois} linhas."
-        )
-    else:
-        print("⚠️ AVISO: Coluna 'NATUREZA_CARGA' não encontrada. O filtro não pôde ser aplicado.")
-
-    return _normalize_dataframe(df)
-
+def _canonical_terminal_sigla_from_norm(value_norm: str) -> Optional[str]:
+    if not value_norm:
+        return None
+    for sigla, aliases in TERMINAL_ALIASES.items():
+        candidates = {_normalize_text(sigla), _normalize_text(TERMINAL_MAPPING.get(sigla, sigla))}
+        candidates.update({_normalize_text(alias) for alias in aliases})
+        if any(c in value_norm for c in candidates if c):
+            return sigla
+    return None
 
 def _normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    if "ANO" in df.columns:
-        df["ANO"] = pd.to_numeric(df["ANO"], errors="coerce").fillna(0).astype(int)
-
-    if "MES" in df.columns:
-        df["MES"] = pd.to_numeric(df["MES"], errors="coerce").fillna(0).astype(int)
-
-    if "TERMINAIS" in df.columns:
-        df["TERMINAIS"] = df["TERMINAIS"].astype(str).str.strip()
-        df["TERMINAIS_NORM"] = df["TERMINAIS"].apply(_normalize_text)
-
-        print(f"🔍 [DEBUG] Alguns terminais encontrados no CSV: {df['TERMINAIS'].unique()[:15]}")
-
-        df["Nome_Terminal_Completo"] = df["TERMINAIS_NORM"].map(
-            {_normalize_text(k): v for k, v in TERMINAL_MAPPING.items()}
-        ).fillna(df["TERMINAIS"])
-
-        df["Nome_Terminal_Completo_NORM"] = df["Nome_Terminal_Completo"].apply(_normalize_text)
-
-    for col in ["TOTAL_TEU", "TOTAL_UNID", "TOTAL_TONELADAS"]:
+    df = df.copy()
+    df["ANO"] = pd.to_numeric(df["ANO"], errors="coerce").fillna(0).astype(int)
+    df["MES"] = pd.to_numeric(df["MES"], errors="coerce").fillna(0).astype(int)
+    df["TERMINAIS_NORM"] = df["TERMINAIS"].apply(_normalize_text)
+    df["TERMINAL_SIGLA_CANONICA"] = df["TERMINAIS_NORM"].apply(_canonical_terminal_sigla_from_norm)
+    
+    for col in ["TOTAL_TEU", "TOTAL_UNID"]:
         if col in df.columns:
-            df[col] = (
-                df[col]
-                .astype(str)
-                .str.replace(".", "", regex=False)
-                .str.replace(",", ".", regex=False)
-            )
+            df[col] = df[col].astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
+    # =================================================================
+    # --- REPLICAÇÃO DA LÓGICA DO POWER QUERY (CARGO MIX) ---
+    colunas_base = ["MERCADORIAS", "MOVIMENTO", "TIPO_NAVEGACAO", "SENTIDO"]
+    
+    # Verifica se o CSV tem todas as colunas necessárias antes de aplicar
+    if set(colunas_base).issubset(df.columns):
+        # Limpa espaços e tira acentos das colunas base para a lógica funcionar
+        for col in colunas_base:
+            df[col] = df[col].apply(_normalize_text)
+
+        # 1. Cheio vs Vazio
+        cond_vazio = df["MERCADORIAS"] == "SEM CARGAS"
+        estado_cv = np.where(cond_vazio, "VAZIO", "CHEIO")
+
+        # 2. Fluxo em Cascata (if... else if...) do Power Query
+        condicoes = [
+            df["MOVIMENTO"] == "REMOÇÃO",
+            df["MOVIMENTO"] == "TRANSBORDO",
+            df["TIPO_NAVEGACAO"] == "CABOTAGEM",
+            df["SENTIDO"] == "DESEMBARQUE"
+        ]
+        escolhas = ["RESTOW", "TRANSBORDO", "CABOTAGEM", "IMPORTACAO"]
+        fluxo = np.select(condicoes, escolhas, default="EXPORTACAO")
+
+        # 3. Mescla e salva na coluna "ESTADO" (substituindo a antiga)
+        df["ESTADO"] = pd.Series(fluxo, index=df.index) + " " + pd.Series(estado_cv, index=df.index)
+    # =================================================================
+
+    # Filtra apenas anos válidos e meses de 1 a 12
+    df = df[(df["ANO"] > 0) & (df["MES"].between(1, 12))].copy()
+    
+    # JEITO SEGURO DE CRIAR DATA: string "YYYY-MM-01"
+    date_strings = df["ANO"].astype(str) + "-" + df["MES"].astype(str).str.zfill(2) + "-01"
+    df["DATE"] = pd.to_datetime(date_strings, errors="coerce")
+    
+    df = df.dropna(subset=["DATE"]).copy()
+    
+    # --- AGREGAÇÕES TEMPORAIS ---
+    df["BIMESTRE"] = ((df["MES"] - 1) // 2 + 1).astype(int)
+    df["ANO_BIMESTRE"] = df["ANO"].astype(str) + "B" + df["BIMESTRE"].astype(str)
+    
+    df["TRIMESTRE"] = ((df["MES"] - 1) // 3 + 1).astype(int)
+    df["ANO_TRIMESTRE"] = df["ANO"].astype(str) + "T" + df["TRIMESTRE"].astype(str)
+    
+    df["QUADRIMESTRE"] = ((df["MES"] - 1) // 4 + 1).astype(int)
+    df["ANO_QUADRIMESTRE"] = df["ANO"].astype(str) + "Q" + df["QUADRIMESTRE"].astype(str)
+    
+    df["SEMESTRE"] = ((df["MES"] - 1) // 6 + 1).astype(int)
+    df["ANO_SEMESTRE"] = df["ANO"].astype(str) + "S" + df["SEMESTRE"].astype(str)
+    
+    df["ANO_MES"] = df["ANO"].astype(str) + "-" + df["MES"].astype(str).str.zfill(2)
+    
     return df
 
-
 def _extract_coverage(df: pd.DataFrame, source_name: str) -> DataCoverage:
-    anos_validos = df.loc[df["ANO"] > 0, "ANO"]
-
-    min_year = int(anos_validos.min()) if not anos_validos.empty else 0
-    max_year = int(anos_validos.max()) if not anos_validos.empty else 0
-
-    meses_min_year = df.loc[df["ANO"] == min_year, "MES"] if min_year > 0 else pd.Series(dtype=int)
-    meses_max_year = df.loc[df["ANO"] == max_year, "MES"] if max_year > 0 else pd.Series(dtype=int)
-
-    min_month = int(meses_min_year.min()) if not meses_min_year.empty else 0
-    max_month = int(meses_max_year.max()) if not meses_max_year.empty else 0
-
+    anos = df.loc[df["ANO"] > 0, "ANO"]
+    meses_max = df.loc[df["ANO"] == anos.max(), "MES"] if not anos.empty else pd.Series(dtype=int)
+    
+    # Extrai os tipos únicos de Cargo Mix (Coluna ESTADO)
+    cm_list = df["ESTADO"].dropna().unique().tolist() if "ESTADO" in df.columns else []
+    
     return DataCoverage(
         source_name=source_name,
-        min_year=min_year,
-        min_month=min_month,
-        max_year=max_year,
-        max_month=max_month,
+        min_year=int(anos.min()) if not anos.empty else 0,
+        min_month=1,
+        max_year=int(anos.max()) if not anos.empty else 0,
+        max_month=int(meses_max.max()) if not meses_max.empty else 0,
         row_count=len(df),
-        loaded_at=datetime.now().isoformat(timespec="seconds")
+        loaded_at=datetime.now().isoformat(timespec="seconds"),
+        cargo_mix_list=cm_list  # <-- SALVA A LISTA AQUI
     )
 
-
-def _coverage_sort_key(item: Tuple[pd.DataFrame, DataCoverage]):
-    _, coverage = item
-    return (coverage.max_year, coverage.max_month, coverage.row_count)
-
-
+@st.cache_data(show_spinner=False)
 def load_port_data():
     diagnostics = []
     candidates = []
-
-    sources = [
-        ("APS", URL_MENSARIO),
-        ("BACKUP", BACKUP_CSV_URL),
-    ]
-
-    for source_name, url in sources:
+    for source_name, url in [("APS", URL_MENSARIO), ("BACKUP", BACKUP_CSV_URL)]:
         try:
             raw_df = _read_csv_from_url(url)
-            df = _apply_business_rules(raw_df)
+            
+            # Aplica regras de negócio essenciais (só contêiner)
+            if "NATUREZA_CARGA" in raw_df.columns:
+                raw_df = raw_df[raw_df["NATUREZA_CARGA"].astype(str).str.strip().eq("CARGA CONTEINERIZADA")]
+                
+            df = _normalize_dataframe(raw_df)
             coverage = _extract_coverage(df, source_name)
-
-            diagnostics.append({
-                "source": source_name,
-                "status": "success",
-                "coverage": asdict(coverage)
-            })
-
-            print(
-                f"✅ Fonte {source_name} carregada com cobertura até "
-                f"{coverage.max_month:02d}/{coverage.max_year}"
-            )
+            diagnostics.append({"source": source_name, "status": "success"})
             candidates.append((df, coverage))
-
-        except Exception as e:
-            diagnostics.append({
-                "source": source_name,
-                "status": "error",
-                "error": str(e)
-            })
-            print(f"⚠️ Falha ao carregar {source_name}: {e}")
+        except Exception as exc:
+            diagnostics.append({"source": source_name, "status": "error", "error": str(exc)})
 
     if not candidates:
-        raise RuntimeError("Não foi possível carregar nem a APS nem o backup.")
+        # Pega os erros reais armazenados no log de diagnósticos
+        error_details = "\n".join([f"- {d['source']}: {d.get('error', 'Erro desconhecido')}" for d in diagnostics if d['status'] == 'error'])
+        raise RuntimeError(f"Falha fatal ao carregar dados. Detalhes dos erros:\n{error_details}")
 
-    selected_df, selected_coverage = max(candidates, key=_coverage_sort_key)
-
-    diagnostics.append({
-        "selected_source": selected_coverage.source_name,
-        "selected_max_year": selected_coverage.max_year,
-        "selected_max_month": selected_coverage.max_month
-    })
-
-    print(
-        f"✅ Fonte selecionada: {selected_coverage.source_name} "
-        f"({selected_coverage.max_month:02d}/{selected_coverage.max_year})"
-    )
-
+    selected_df, selected_coverage = max(candidates, key=lambda c: (c[1].max_year, c[1].max_month))
     return selected_df, selected_coverage, diagnostics
 
-
-def get_data_coverage_text(coverage: DataCoverage, diagnostics: list) -> str:
-    status_fontes = []
-    for item in diagnostics:
-        if item.get("status") == "success":
-            cov = item.get("coverage", {})
-            status_fontes.append(
-                f"- {item['source']}: ok, até {cov.get('max_month', 0):02d}/{cov.get('max_year', 0)}"
-            )
-        elif item.get("status") == "error":
-            status_fontes.append(f"- {item['source']}: erro ({item.get('error', 'sem detalhe')})")
-
-    status_fontes_str = "\n".join(status_fontes) if status_fontes else "- Sem diagnóstico disponível"
-
-    return (
-        f"Fonte ativa: {coverage.source_name}\n"
-        f"Cobertura: {coverage.min_month:02d}/{coverage.min_year} até {coverage.max_month:02d}/{coverage.max_year}\n"
-        f"Linhas: {coverage.row_count:,}\n"
-        f"Carregado em: {coverage.loaded_at}\n"
-        f"Diagnóstico das fontes:\n{status_fontes_str}"
-    )
-
-
-def _resolve_terminal_aliases(termo_busca: str) -> List[str]:
-    termo_norm = _normalize_text(termo_busca)
-
-    aliases = {termo_norm}
-
-    for key, values in TERMINAL_ALIASES.items():
-        key_norm = _normalize_text(key)
-        values_norm = {_normalize_text(v) for v in values}
-
-        if termo_norm == key_norm or termo_norm in values_norm:
-            aliases.update(values_norm)
-            aliases.add(key_norm)
-
-            nome_completo = TERMINAL_MAPPING.get(key, key)
-            aliases.add(_normalize_text(nome_completo))
-
-    nome_extenso = TERMINAL_MAPPING.get(termo_busca.upper(), termo_busca)
-    aliases.add(_normalize_text(nome_extenso))
-
-    return list(aliases)
-
-
-def _encontrar_terminal(df: pd.DataFrame, termo_busca: str) -> pd.Series:
-    if "TERMINAIS_NORM" not in df.columns:
-        raise ValueError("Coluna 'TERMINAIS_NORM' não encontrada no DataFrame.")
-
-    aliases = _resolve_terminal_aliases(termo_busca)
-
-    mask = pd.Series(False, index=df.index)
-
-    for alias in aliases:
-        mask = (
-            mask
-            | (df["TERMINAIS_NORM"] == alias)
-            | df["TERMINAIS_NORM"].str.contains(alias, case=False, na=False)
-        )
-
-        if "Nome_Terminal_Completo_NORM" in df.columns:
-            mask = (
-                mask
-                | (df["Nome_Terminal_Completo_NORM"] == alias)
-                | df["Nome_Terminal_Completo_NORM"].str.contains(alias, case=False, na=False)
-            )
-
-    return mask
-
-
-def get_volume(df: pd.DataFrame, terminal_sigla: str, ano: int, meses: list = None) -> str:
-    mask = df["ANO"] == ano
-
-    if meses and len(meses) > 0:
-        mask &= df["MES"].isin(meses)
-
-    if terminal_sigla.upper() != "PORTO":
-        mask &= _encontrar_terminal(df, terminal_sigla)
-
-    df_filtrado = df[mask]
-
-    if df_filtrado.empty:
-        mes_str = f" nos meses {meses}" if meses else ""
-        return f"Sem dados para {terminal_sigla} no ano de {ano}{mes_str}."
-
-    total_teus = df_filtrado["TOTAL_TEU"].sum()
-
-    coluna_unidades = "TOTAL_UNID"
-    if coluna_unidades in df_filtrado.columns:
-        total_conteineres = df_filtrado[coluna_unidades].sum()
-        teu_ratio = (total_teus / total_conteineres) if total_conteineres > 0 else 0
-    else:
-        total_conteineres = 0
-        teu_ratio = 0
-        return f"Erro: Coluna de unidades não encontrada. Total TEU: {total_teus:,.0f}"
-
-    nome_terminal = "Porto de Santos" if terminal_sigla.upper() == "PORTO" else TERMINAL_MAPPING.get(terminal_sigla.upper(), terminal_sigla)
-    mes_str = f" (Meses: {meses})" if meses else ""
-
-    return (
-        f"Resultados de movimentação para {nome_terminal} em {ano}{mes_str}:\n"
-        f"- Total TEUs: {total_teus:,.0f}\n"
-        f"- Total Contêineres (Unidades): {total_conteineres:,.0f}\n"
-        f"- TEU Ratio: {teu_ratio:.2f} TEUs/Contêiner\n"
-    )
-
-
-def get_market_share(df: pd.DataFrame, ano: int, terminal_sigla: str, meses: list = None) -> str:
-    df_filtrado = df[df["ANO"] == ano].copy()
-
-    if meses:
-        df_filtrado = df_filtrado[df_filtrado["MES"].isin(meses)]
-        periodo = f"nos meses {meses} de {ano}"
-    else:
-        periodo = f"no ano {ano}"
-
-    total_porto = df_filtrado["TOTAL_TEU"].sum()
-
-    if total_porto == 0:
-        return f"Não há dados de movimentação no porto para o período solicitado ({periodo})."
-
-    if terminal_sigla.upper() == "PORTO":
-        return (
-            f"O volume total do Porto de Santos {periodo} foi de "
-            f"{total_porto:,.0f} TEUs."
-        )
-
-    mask_terminal = _encontrar_terminal(df_filtrado, terminal_sigla)
-    total_terminal = df_filtrado[mask_terminal]["TOTAL_TEU"].sum()
-    market_share = (total_terminal / total_porto) * 100 if total_porto > 0 else 0
-
-    nome_terminal = TERMINAL_MAPPING.get(terminal_sigla.upper(), terminal_sigla)
-
-    return (
-        f"O market share da {nome_terminal} {periodo} foi de {market_share:.2f}% "
-        f"(Volume do terminal: {total_terminal:,.0f} TEUs. "
-        f"Volume do porto: {total_porto:,.0f} TEUs)."
-    )
-
-
-def get_cargo_mix(df: pd.DataFrame, terminal_sigla: str, ano: int, meses: list = None) -> str:
-    mask = df["ANO"] == ano
-
-    if meses and len(meses) > 0:
-        mask &= df["MES"].isin(meses)
-
-    if terminal_sigla.upper() != "PORTO":
-        mask &= _encontrar_terminal(df, terminal_sigla)
-
-    df_filtrado = df[mask].copy()
-
-    if df_filtrado.empty:
-        mes_str = f" nos meses {meses}" if meses else ""
-        return f"Sem dados para {terminal_sigla} no ano de {ano}{mes_str}."
-
-    df_filtrado["ESTADO"] = "Cheio"
-    if "MERCADORIAS" in df_filtrado.columns:
-        df_filtrado.loc[df_filtrado["MERCADORIAS"] == "SEM CARGAS", "ESTADO"] = "Vazio"
-
-    df_filtrado["CATEGORIA"] = "Outros"
-
-    if "SENTIDO" in df_filtrado.columns:
-        df_filtrado.loc[df_filtrado["SENTIDO"] == "EMBARQUE", "CATEGORIA"] = "Exportação"
-        df_filtrado.loc[df_filtrado["SENTIDO"] == "DESEMBARQUE", "CATEGORIA"] = "Importação"
-
-    if "TIPO_NAVEGACAO" in df_filtrado.columns:
-        df_filtrado.loc[df_filtrado["TIPO_NAVEGACAO"] == "CABOTAGEM", "CATEGORIA"] = "Cabotagem"
-
-    if "MOVIMENTO" in df_filtrado.columns:
-        df_filtrado.loc[df_filtrado["MOVIMENTO"] == "TRANSBORDO", "CATEGORIA"] = "Transbordo"
-        df_filtrado.loc[df_filtrado["MOVIMENTO"] == "REMOÇÃO", "CATEGORIA"] = "Remoção"
-
-    df_filtrado["MIX_FINAL"] = df_filtrado["CATEGORIA"] + " " + df_filtrado["ESTADO"]
-
-    resumo_mix = (
-        df_filtrado.groupby("MIX_FINAL")["TOTAL_TEU"]
-        .sum()
-        .sort_values(ascending=False)
-    )
-
-    total_teus = resumo_mix.sum()
-    mes_str = f" (Meses: {meses})" if meses else ""
-    nome_terminal = "Porto de Santos" if terminal_sigla.upper() == "PORTO" else TERMINAL_MAPPING.get(terminal_sigla.upper(), terminal_sigla)
-
-    resultado = f"Mix de Cargas de {nome_terminal} em {ano}{mes_str} - Total: {total_teus:,.0f} TEUs:\n"
-
-    for categoria, volume in resumo_mix.items():
-        percentual = (volume / total_teus) * 100 if total_teus > 0 else 0
-        resultado += f"- {categoria}: {volume:,.0f} TEUs ({percentual:.2f}%)\n"
-
-    return resultado
-
-
-def get_growth(
+def query_port_data(
     df: pd.DataFrame,
-    terminal_sigla: str,
-    ano_base: int,
-    ano_comparacao: int,
-    meses_base: list = None,
-    meses_comparacao: list = None,
-    cargo_mix: str = None
+    metric: str = "teus",
+    start_date: str = None, 
+    end_date: str = None, 
+    terminals: list = None,
+    cargo_mix_filter: list = None, # <-- NOVO FILTRO AQUI
+    group_by: str = None,
+    compare_with_previous: bool = False
 ) -> str:
-    df_filtrado = df.copy()
+    """Motor universal de agregação."""
+    df_filtered = df.copy()
 
-    if terminal_sigla.upper() != "PORTO":
-        mask_terminal = _encontrar_terminal(df_filtrado, terminal_sigla)
-        df_filtrado = df_filtrado[mask_terminal]
+    # 1. Filtros de Período
+    if start_date:
+        df_filtered = df_filtered[df_filtered['DATE'] >= pd.to_datetime(start_date)]
+    if end_date:
+        df_filtered = df_filtered[df_filtered['DATE'] <= pd.to_datetime(end_date)]
+        
+    # 2. Filtros de Terminal e Cargo Mix
+    if terminals and len(terminals) > 0:
+        df_filtered = df_filtered[df_filtered['TERMINAL_SIGLA_CANONICA'].isin(terminals)]
+        
+    if cargo_mix_filter and len(cargo_mix_filter) > 0:
+        cm_upper = [str(c).upper() for c in cargo_mix_filter]
+        df_filtered = df_filtered[df_filtered['ESTADO'].astype(str).str.upper().isin(cm_upper)]
+        
+    if df_filtered.empty:
+        return f"[AVISO DO SISTEMA] Nenhum dado encontrado. Filtros usados: Terminais={terminals}, CargoMix={cargo_mix_filter}, Periodo={start_date} a {end_date}. O bot deve informar isso ao usuário."
 
-    if cargo_mix:
-        df_filtrado["ESTADO"] = "Cheio"
-        if "MERCADORIAS" in df_filtrado.columns:
-            df_filtrado.loc[df_filtrado["MERCADORIAS"] == "SEM CARGAS", "ESTADO"] = "Vazio"
+    # 3. Definição da Coluna de Métrica Base
+    val_col = "TOTAL_TEU" if metric in ["teus", "market_share", "cagr"] else "TOTAL_UNID"
 
-        df_filtrado["CATEGORIA"] = "Outros"
+    if compare_with_previous and not df_filtered.empty:
+        max_year = df_filtered["ANO"].max()
+        # Descobre qual é o último mês disponível no ano mais recente
+        max_month = df_filtered[df_filtered["ANO"] == max_year]["MES"].max()
+        
+        # Corta os anos anteriores no mesmo mês limite
+        if pd.notna(max_month):
+            df_filtered = df_filtered[df_filtered["MES"] <= max_month]
 
-        if "SENTIDO" in df_filtrado.columns:
-            df_filtrado.loc[df_filtrado["SENTIDO"] == "EMBARQUE", "CATEGORIA"] = "Exportação"
-            df_filtrado.loc[df_filtrado["SENTIDO"] == "DESEMBARQUE", "CATEGORIA"] = "Importação"
+# 4. Agrupamento Múltiplo (Tabela Dinâmica)
+    groupby_cols = []
+    if group_by:
+        # Se vier só uma string, transforma em lista para não quebrar
+        if isinstance(group_by, str): 
+            group_by = [group_by]
+            
+        for gb in group_by:
+            if gb == "ano": groupby_cols.append("ANO")
+            elif gb == "semestre": groupby_cols.append("ANO_SEMESTRE")
+            elif gb == "quadrimestre": groupby_cols.append("ANO_QUADRIMESTRE")
+            elif gb == "trimestre": groupby_cols.append("ANO_TRIMESTRE")
+            elif gb == "bimestre": groupby_cols.append("ANO_BIMESTRE")
+            elif gb == "mes": groupby_cols.append("ANO_MES")
+            elif gb == "terminal": groupby_cols.append("TERMINAL_SIGLA_CANONICA")
+            elif gb == "cargo_mix": groupby_cols.append("ESTADO")
 
-        if "TIPO_NAVEGACAO" in df_filtrado.columns:
-            df_filtrado.loc[df_filtrado["TIPO_NAVEGACAO"] == "CABOTAGEM", "CATEGORIA"] = "Cabotagem"
-
-        if "MOVIMENTO" in df_filtrado.columns:
-            df_filtrado.loc[df_FILTRADO["MOVIMENTO"] == "TRANSBORDO", "CATEGORIA"] = "Transbordo"
-            df_filtrado.loc[df_filtrado["MOVIMENTO"] == "REMOÇÃO", "CATEGORIA"] = "Remoção"
-
-        df_filtrado["MIX_FINAL"] = df_filtrado["CATEGORIA"] + " " + df_filtrado["ESTADO"]
-        df_filtrado = df_filtrado[df_filtrado["MIX_FINAL"].str.lower() == cargo_mix.lower()]
-
-    mask_base = df_filtrado["ANO"] == ano_base
-    if meses_base and len(meses_base) > 0:
-        mask_base &= df_filtrado["MES"].isin(meses_base)
-    vol_base = df_filtrado[mask_base]["TOTAL_TEU"].sum()
-
-    mask_comp = df_filtrado["ANO"] == ano_comparacao
-    if meses_comparacao and len(meses_comparacao) > 0:
-        mask_comp &= df_filtrado["MES"].isin(meses_comparacao)
-    vol_comp = df_filtrado[mask_comp]["TOTAL_TEU"].sum()
-
-    if vol_base == 0:
-        if vol_comp == 0:
-            return f"Não houve movimentação em ambos os períodos para {terminal_sigla}."
-        return f"Crescimento de 100% (volume base era zero, e agora é {vol_comp:,.0f} TEUs)."
-
-    crescimento = ((vol_comp - vol_base) / vol_base) * 100
-
-    mix_texto = f" na categoria '{cargo_mix}'" if cargo_mix else ""
-    meses_base_str = f" nos meses {meses_base}" if meses_base else ""
-    meses_comp_str = f" nos meses {meses_comparacao}" if meses_comparacao else ""
-    nome_terminal = "Porto de Santos" if terminal_sigla.upper() == "PORTO" else TERMINAL_MAPPING.get(terminal_sigla.upper(), terminal_sigla)
-
-    resultado = (
-        f"Análise de Crescimento para {nome_terminal}{mix_texto}:\n"
-        f"- Período Base ({ano_base}{meses_base_str}): {vol_base:,.0f} TEUs\n"
-        f"- Período Atual ({ano_comparacao}{meses_comp_str}): {vol_comp:,.0f} TEUs\n"
-        f"- Variação: {crescimento:.2f}%\n"
-    )
-
-    return resultado
-
-
-def plotar_grafico(
-    df: pd.DataFrame,
-    tipo_grafico: str,
-    tema: str = "market_share",
-    anos: list = None,
-    terminal_sigla: str = "PORTO"
-) -> str:
-    if anos is None or len(anos) == 0:
-        anos = [int(df["ANO"].max())]
-
-    anos = sorted(anos)
-    df_filtrado = df[df["ANO"].isin(anos)].copy()
-
-    if df_filtrado.empty:
-        return "Não há dados para gerar o gráfico no período solicitado."
-
-    plt.figure(figsize=(10, 5))
-    titulo_anos = f"{anos[0]} a {anos[-1]}" if len(anos) > 1 else str(anos[0])
-    plt.title(f"{tema.replace('_', ' ').title()} - {terminal_sigla} ({titulo_anos})")
-
-    if tema == "market_share":
-        resumo = df_filtrado.groupby("TERMINAIS")["TOTAL_TEU"].sum().sort_values(ascending=False)
-        top3 = resumo.head(3)
-        outros = pd.Series({"OUTROS": resumo.iloc[3:].sum()}) if len(resumo) > 3 else pd.Series(dtype=float)
-        dados_finais = pd.concat([top3, outros])
-
-        if tipo_grafico in ["pizza", "rosca"]:
-            plt.pie(dados_finais, labels=dados_finais.index, autopct="%1.1f%%", startangle=90)
-            if tipo_grafico == "rosca":
-                centro = plt.Circle((0, 0), 0.70, fc="white")
-                plt.gca().add_artist(centro)
-        else:
-            plt.bar(dados_finais.index, dados_finais.values)
-            plt.ylabel("TEUs")
-
-    elif tema == "evolucao_mensal":
-        if terminal_sigla.upper() != "PORTO":
-            mask = _encontrar_terminal(df_filtrado, terminal_sigla)
-            df_filtrado = df_filtrado[mask]
-
-        if df_filtrado.empty:
-            plt.close()
-            return "Não há dados para gerar o gráfico do terminal solicitado."
-
-        df_filtrado["ANO_MES"] = (
-            df_filtrado["ANO"].astype(str)
-            + "-"
-            + df_filtrado["MES"].astype(str).str.zfill(2)
-        )
-
-        resumo_mensal = (
-            df_filtrado.groupby("ANO_MES")["TOTAL_TEU"]
-            .sum()
-            .sort_index()
-        )
-
-        if tipo_grafico == "linha":
-            plt.plot(resumo_mensal.index, resumo_mensal.values, marker="o", linestyle="-")
-            plt.grid(True, linestyle="--", alpha=0.6)
-        else:
-            plt.bar(resumo_mensal.index, resumo_mensal.values)
-
-        plt.xticks(rotation=60 if len(resumo_mensal) > 12 else 0)
-        plt.xlabel("Mês/Ano")
-        plt.ylabel("TEUs")
-
+    if groupby_cols:
+        aggregated = df_filtered.groupby(groupby_cols)[val_col].sum().reset_index()
     else:
-        plt.close()
-        return f"Tema de gráfico '{tema}' não suportado."
+        aggregated = pd.DataFrame([{"Total": df_filtered[val_col].sum()}])
+        val_col = "Total"
 
-    plt.tight_layout()
+# 5. Cálculo de Crescimento / Variação Percentual
+    if compare_with_previous and not aggregated.empty:
+        aggregated = aggregated.sort_values(by=groupby_cols)
+        
+        # Se agrupou por mais de uma coluna (ex: ["terminal", "ano"]), calcula a variação DENTRO de cada terminal
+        if len(groupby_cols) > 1 and "ANO" in groupby_cols:
+            cols_except_year = [c for c in groupby_cols if c != "ANO"]
+            aggregated['Crescimento (%)'] = aggregated.groupby(cols_except_year)[val_col].pct_change() * 100
+        else:
+            aggregated['Crescimento (%)'] = aggregated[val_col].pct_change() * 100
+            
+        # Limpa os resultados vazios do primeiro ano e formata com %
+        aggregated['Crescimento (%)'] = aggregated['Crescimento (%)'].round(2).fillna(0).astype(str) + "%"
 
-    filename = f"grafico_{uuid.uuid4().hex}.png"
-    caminho_arquivo = os.path.join(TEMP_GRAPH_DIR, filename)
+    # 6. Cálculo de Share / Proporção Percentual
+    if metric == "market_share":
+        total_geral = aggregated[val_col].sum()
+        if total_geral > 0:
+            # Calcula a porcentagem
+            aggregated['Share (%)'] = ((aggregated[val_col] / total_geral) * 100).round(2)
+            # Ordena do maior para o menor para facilitar a leitura
+            aggregated = aggregated.sort_values(by='Share (%)', ascending=False)
+            # Formata como string com símbolo % para o bot entender direto
+            aggregated['Share (%)'] = aggregated['Share (%)'].astype(str) + "%"
 
-    plt.savefig(caminho_arquivo, format="png", bbox_inches="tight")
-    plt.close()
+    if val_col in aggregated.columns:
+        aggregated[val_col] = aggregated[val_col].round(0).astype(int)
 
-    return f"Gráfico gerado com sucesso em: {caminho_arquivo}"
+    return aggregated.to_string(index=False)

@@ -1,163 +1,145 @@
-import os
 import json
-from dotenv import load_dotenv
-from openai import OpenAI
+import os
+from typing import Any, Dict, List, Optional
 
-from agent.data_agent import PortDataAgent
-from agent.knowledge_agent import KnowledgeAgent
+from dotenv import load_dotenv
+
+try:
+    from agent.data_agent import PortDataAgent
+    from agent.knowledge_agent import KnowledgeAgent
+except ImportError:
+    from data_agent import PortDataAgent
+    from knowledge_agent import KnowledgeAgent
 
 load_dotenv()
 
-
 class CoordinatorAgent:
-    def __init__(self):
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    def __init__(self, session_id: Optional[str] = None):
+        self.session_id = session_id
+        self.model_name = os.getenv("COORDINATOR_AGENT_MODEL", "gpt-4o")
+        self.client = None
+
+        api_key = os.getenv("OPENAI_API_KEY")
+        if api_key:
+            try:
+                from openai import OpenAI
+                self.client = OpenAI(api_key=api_key)
+            except Exception:
+                self.client = None
 
         print("Iniciando Agente Coordenador...")
-
         self.data_agent = PortDataAgent()
         self.knowledge_agent = KnowledgeAgent()
-
-        self.memory = [
-            {
-                "role": "system",
-                "content": """
-Você é o Agente Coordenador Especialista do Porto de Santos.
-
-Sua função é atender o usuário, manter o contexto da conversa e coordenar agentes especialistas.
-
-Você possui acesso aos seguintes agentes subordinados:
-- data_analyst: especialista em dados quantitativos (TEUs, market share, crescimento, mix de carga, volumes, comparações e séries).
-- knowledge_specialist: especialista em conhecimento documental e qualitativo (investimentos, expansão, regras, contexto institucional, explicações baseadas em documentos).
-
-Regras de roteamento:
-1. Se a pergunta for um cumprimento simples, responda diretamente.
-2. Se a pergunta for quantitativa, chame consult_data_analyst.
-3. Se a pergunta for qualitativa, documental, regulatória ou explicativa, chame consult_knowledge_specialist.
-4. Se a pergunta exigir números + contexto, você pode chamar os dois agentes e consolidar a resposta.
-5. Preserve o contexto recente da conversa para resolver follow-ups como:
-   - "e a BTP?"
-   - "agora compare com 2025"
-   - "e no porto como um todo?"
-6. Ao responder ao usuário, seja claro, objetivo e natural.
+        self.system_message = {
+            "role": "system",
+            "content": """
+            Você é o Assistente Virtual Principal do Porto de Santos.
+            Sua função é atender o usuário, classificar a intenção e buscar os dados necessários usando suas ferramentas (agentes subordinados).
+            
+            [REGRA DE OURO - COMPORTAMENTO]
+            Você DEVE agir como um assistente único. NUNCA diga coisas como "O analista de dados informou", "Encaminhei sua pergunta", ou "Consultei o especialista". 
+            Apenas receba a resposta da ferramenta e entregue a informação diretamente ao usuário de forma natural, direta e em primeira pessoa.
+            
+            [FERRAMENTAS]
+            - consult_data_analyst: use para perguntas quantitativas, dados, volume, market share, crescimento, prazos, comparações e também perguntas sobre MIX DE CARGA (cargo mix), tipo de carga, cheio/vazio, cabotagem, etc.
+            - consult_knowledge_specialist: use para perguntas qualitativas e textuais sobre as regras do porto.
 """
-            }
-        ]
+        }
+
+        self.history: List[Dict[str, str]] = []
+        self.max_history_messages = 8
 
         self.tools = [
             {
                 "type": "function",
                 "function": {
                     "name": "consult_data_analyst",
-                    "description": "Encaminha a pergunta para o agente analista de dados. Use para perguntas numéricas, séries, market share, crescimento, mix, TEUs, volumes e comparações.",
+                    "description": "Encaminha a pergunta de dados ou estatísticas para o analista de dados.",
                     "parameters": {
                         "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "Pergunta reformulada com contexto suficiente para o analista de dados."
-                            }
-                        },
-                        "required": ["query"]
-                    }
-                }
+                        "properties": {"query": {"type": "string", "description": "A requisição original do usuário"}},
+                        "required": ["query"],
+                    },
+                },
             },
             {
                 "type": "function",
                 "function": {
                     "name": "consult_knowledge_specialist",
-                    "description": "Encaminha a pergunta para o agente de conhecimento. Use para perguntas qualitativas, regulatórias, documentais, institucionais e contextuais.",
+                    "description": "Encaminha a pergunta conceitual/qualitativa para o especialista de documentos.",
                     "parameters": {
                         "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "Pergunta reformulada com contexto suficiente para o agente de conhecimento."
-                            }
-                        },
-                        "required": ["query"]
-                    }
-                }
-            }
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                },
+            },
         ]
 
-    def _build_recent_context(self, max_messages: int = 6) -> str:
-        recent = []
-
-        for msg in self.memory[-max_messages:]:
-            if isinstance(msg, dict) and msg.get("role") in {"user", "assistant"}:
-                role = msg.get("role", "")
-                content = msg.get("content", "")
-                recent.append(f"{role}: {content}")
-
-        return "\n".join(recent)
-
     def chat(self, user_message: str) -> str:
-        self.memory.append({"role": "user", "content": user_message})
+        if not self.client:
+            return "Erro: OpenAI API key não configurada no Agente Coordenador."
+
+        recent_context = "\n".join(f"{msg['role']}: {msg['content']}" for msg in self.history[-4:])
+        
+        model_messages = [self.system_message] + self.history + [{"role": "user", "content": user_message}]
 
         response = self.client.chat.completions.create(
-            model="gpt-4o",
-            messages=self.memory,
+            model=self.model_name,
+            messages=model_messages,
             tools=self.tools,
-            tool_choice="auto"
+            temperature=0.0
         )
 
         response_message = response.choices[0].message
-        final_text = response_message.content or ""
 
-        if response_message.tool_calls:
-            self.memory.append(response_message)
-            recent_context = self._build_recent_context()
+        if not response_message.tool_calls:
+            final_text = response_message.content or ""
+            self.history.extend([
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": final_text},
+            ])
+            self.history = self.history[-self.max_history_messages :]
+            return final_text
 
-            for tool_call in response_message.tool_calls:
-                function_name = tool_call.function.name
-                args = json.loads(tool_call.function.arguments or "{}")
-                worker_query = args.get("query", user_message)
+        model_messages.append(response_message)
+        for tool_call in response_message.tool_calls:
+            function_name = tool_call.function.name
+            args = json.loads(tool_call.function.arguments)
+            worker_query = args.get("query", user_message)
 
-                print(f"🔄 [Coordenador] Tool acionada: {function_name}")
-                print(f"🔄 [Coordenador] Query delegada: {worker_query}")
+            print(f"\n🤖 [COORDENADOR] Encaminhando para: {function_name}")
+            print(f"🧠 [RACIOCÍNIO] Tradução da pergunta: {worker_query}")
 
+            # GARANTA QUE O CONTEXTO SEJA EXTRAÍDO ASSIM:
+            recent_context = "\n".join([f"{msg['role']}: {msg['content']}" for msg in self.history[-4:]])
+            
+            # REFORCE A PERGUNTA COM O CONTEXTO PARA O SUB-AGENTE:
+            enriched_query = f"Contexto da conversa:\n{recent_context}\n\nPergunta atual: {worker_query}"
+
+            try:
                 if function_name == "consult_data_analyst":
-                    worker_response = self.data_agent.ask(
-                        worker_query,
-                        context=recent_context
-                    )
-
+                    worker_response = self.data_agent.ask(enriched_query) # Passando a pergunta enriquecida
                 elif function_name == "consult_knowledge_specialist":
-                    worker_response = self.knowledge_agent.ask(
-                        worker_query,
-                        context=recent_context
-                    )
-
+                    worker_response = self.knowledge_agent.ask(enriched_query)
                 else:
-                    worker_response = "Erro: ferramenta de coordenação não reconhecida."
+                    worker_response = "Erro: ferramenta desconhecida."
+            except Exception as exc:
+                worker_response = f"Falha na execução: {exc}"
 
-                self.memory.append({
-                    "tool_call_id": tool_call.id,
-                    "role": "tool",
-                    "name": function_name,
-                    "content": str(worker_response)
-                })
+            model_messages.append({
+                "tool_call_id": tool_call.id,
+                "role": "tool",
+                "name": function_name,
+                "content": str(worker_response),
+            })
 
-            final_response = self.client.chat.completions.create(
-                model="gpt-4o",
-                messages=self.memory
-            )
-
-            final_text = final_response.choices[0].message.content or ""
-
-        self.memory.append({"role": "assistant", "content": final_text})
+        final_response = self.client.chat.completions.create(model=self.model_name, messages=model_messages)
+        final_text = final_response.choices[0].message.content or ""
+        
+        self.history.extend([
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": final_text},
+        ])
+        self.history = self.history[-self.max_history_messages :]
         return final_text
-
-
-if __name__ == "__main__":
-    coordenador = CoordinatorAgent()
-
-    print("\n--- Iniciando Chat (Digite 'sair' para encerrar) ---")
-    while True:
-        pergunta = input("\nVocê: ")
-        if pergunta.lower() in ["sair", "exit", "quit"]:
-            break
-
-        resposta = coordenador.chat(pergunta)
-        print(f"\nCoordenador: {resposta}")

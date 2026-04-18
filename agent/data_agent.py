@@ -1,383 +1,228 @@
 import json
 import os
 import sys
-import re
+from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
-from openai import OpenAI
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# --- CORREÇÃO DE ROTAS (IMPORT RESOLVIDO) ---
+# Pega a pasta atual do script (ex: port_agent_g/agent)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Pega a pasta raiz do projeto (ex: port_agent_g)
+ROOT_DIR = os.path.dirname(BASE_DIR)
 
-from tools.port_data_tools import (
-    load_port_data,
-    get_market_share,
-    get_cargo_mix,
-    get_growth,
-    get_volume,
-    plotar_grafico,
-    get_data_coverage_text
-)
+# Injeta ambas as pastas no "radar" do Python
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
+if BASE_DIR not in sys.path:
+    sys.path.append(BASE_DIR)
+
+# Agora o Python consegue achar o arquivo, não importa se ele está na pasta tools ou solto
+try:
+    from tools.port_data_tools import load_port_data, query_port_data
+except ImportError:
+    from port_data_tools import load_port_data, query_port_data
+# --------------------------------------------
 
 load_dotenv()
 
-
 class PortDataAgent:
-    def __init__(self):
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    def __init__(self, chart_output_dir: Optional[str] = None):
+        self.chart_output_dir = chart_output_dir
+        self.last_generated_chart_path: Optional[str] = None
+        
+        # MEMÓRIA DE CURTO PRAZO: Mantém o contexto fluido sem lotar os tokens
+        self.current_filters = {
+            "start_date": None,
+            "end_date": None,
+            "terminals": [],
+            "metric": "teus"
+        }
 
         print("Iniciando Agente Analista de Dados...")
-
         self.df, self.data_coverage, self.data_diagnostics = load_port_data()
 
-        self.max_year = self.data_coverage.max_year
-        self.latest_months = sorted(
-            self.df.loc[self.df["ANO"] == self.max_year, "MES"].dropna().unique().tolist()
-        )
-        self.latest_complete_year = self._get_latest_complete_year()
-
-        meses_str = str(self.latest_months)
-
-        self.system_prompt = f"""
-Você é o Agente Especialista em Dados do Porto de Santos.
-Seu objetivo é responder perguntas precisas sobre movimentação de carga, volumes (TEUs), unidades, market share, crescimento e mix dos terminais.
-
-CONTEXTO DA BASE ATIVA:
-- Fonte ativa: {self.data_coverage.source_name}
-- Cobertura temporal: até {self.data_coverage.max_month:02d}/{self.data_coverage.max_year}
-- Meses disponíveis no ano mais recente ({self.max_year}): {meses_str}
-
-REGRAS IMPORTANTES:
-1. NUNCA invente números. Sempre use as ferramentas.
-2. O usuário pode usar siglas como SBSA, BTP e DPW.
-3. Sempre explicite o período analisado e o filtro aplicado.
-4. Se o usuário perguntar sobre cobertura, atualização da base, origem da base, data mais recente ou status dos dados, use a ferramenta get_data_coverage.
-5. Se houver contexto recente fornecido, use esse contexto para resolver follow-ups.
-6. Se o usuário pedir TEU Ratio, use get_volume.
-7. Se o usuário pedir gráficos, use plotar_grafico.
-8. Se o usuário pedir análise do porto como um todo, use "PORTO" como terminal_sigla.
-9. Se o usuário pedir uma comparação, organize a resposta de forma clara.
-10. SE O USUÁRIO NÃO INFORMAR O ANO em perguntas quantitativas, NÃO escolha um ano arbitrariamente.
-11. Se o ano mais recente da base estiver incompleto, use o período mais recente disponível e explicite que a resposta é parcial/YTD.
-12. Só use um ano fechado anterior se o usuário pedir explicitamente "ano fechado", "ano completo" ou citar o ano desejado.
-"""
+        api_key = os.getenv("OPENAI_API_KEY")
+        self.client = None
+        self.model_name = os.getenv("PORT_DATA_AGENT_MODEL", "gpt-4o")
+        if api_key:
+            try:
+                from openai import OpenAI
+                self.client = OpenAI(api_key=api_key)
+            except Exception:
+                self.client = None
 
         self.tools = [
             {
                 "type": "function",
                 "function": {
-                    "name": "get_volume",
-                    "description": "Calcula a movimentação total de um terminal. Retorna TEUs, contêineres (unidades físicas) e TEU Ratio.",
+                    "name": "query_port_data",
+                    "description": "Faz qualquer consulta de dados, agregação ou comparação de períodos no formato YYYY-MM-DD. Use para volumes, market share, crescimento, cargo mix.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "terminal_sigla": {
+                            "metric": {
+                                "type": "string", 
+                                "enum": ["teus", "conteineres", "market_share", "cagr"],
+                                "description": "Qual métrica extrair"
+                            },
+                            "start_date": {
                                 "type": "string",
-                                "description": "Sigla do terminal ou 'PORTO'."
+                                "description": "Data de início em YYYY-MM-DD. Ex: 2021-01-01"
                             },
-                            "ano": {
-                                "type": "integer",
-                                "description": "Ano da análise."
+                            "end_date": {
+                                "type": "string",
+                                "description": "Data final em YYYY-MM-DD. Ex: 2023-12-31"
                             },
-                            "meses": {
+                            "terminals": {
                                 "type": "array",
-                                "items": {"type": "integer"},
-                                "description": "Lista de meses, por exemplo [1, 2, 3]."
+                                "items": {"type": "string"},
+                                "description": "Lista de terminais. Deixe vazio para o porto inteiro."
+                            },
+                            "cargo_mix_filter": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Filtra por tipos específicos de Cargo Mix (ex: ['REMOÇÃO', 'EXPORTAÇÃO'])."
+                            },
+                            "group_by": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                    "enum": ["ano", "semestre", "quadrimestre", "trimestre", "bimestre", "mes", "terminal", "cargo_mix"],
+                                },
+                                "description": "Como agrupar os dados. Pode cruzar informações passando mais de um (ex: ['mes', 'terminal'])."
+                            },
+                            "compare_with_previous": {
+                                "type": "boolean",
+                                "description": "True se o usuário pedir crescimento (YoY/MoM/Crescimento) para calcular a %"
                             }
                         },
-                        "required": ["terminal_sigla", "ano"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_market_share",
-                    "description": "Calcula o market share em TEUs de um terminal em um ano e, opcionalmente, em meses específicos.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "ano": {
-                                "type": "integer",
-                                "description": "Ano da análise."
-                            },
-                            "terminal_sigla": {
-                                "type": "string",
-                                "description": "Sigla do terminal."
-                            },
-                            "meses": {
-                                "type": "array",
-                                "items": {"type": "integer"},
-                                "description": "Lista de meses."
-                            }
-                        },
-                        "required": ["ano", "terminal_sigla"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_growth",
-                    "description": "Calcula a variação percentual em TEUs entre dois períodos. Suporta comparação anual, mensal ou por mix de carga.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "terminal_sigla": {
-                                "type": "string",
-                                "description": "Sigla do terminal ou 'PORTO'."
-                            },
-                            "ano_base": {
-                                "type": "integer",
-                                "description": "Ano do período base."
-                            },
-                            "ano_comparacao": {
-                                "type": "integer",
-                                "description": "Ano do período de comparação."
-                            },
-                            "meses_base": {
-                                "type": "array",
-                                "items": {"type": "integer"},
-                                "description": "Meses do período base."
-                            },
-                            "meses_comparacao": {
-                                "type": "array",
-                                "items": {"type": "integer"},
-                                "description": "Meses do período de comparação."
-                            },
-                            "cargo_mix": {
-                                "type": "string",
-                                "description": "Opcional. Ex: 'Importação Cheio', 'Exportação Vazio', 'Cabotagem Cheio'."
-                            }
-                        },
-                        "required": ["terminal_sigla", "ano_base", "ano_comparacao"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_cargo_mix",
-                    "description": "Retorna a quebra do tipo de carga de um terminal.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "terminal_sigla": {
-                                "type": "string",
-                                "description": "Sigla do terminal ou 'PORTO'."
-                            },
-                            "ano": {
-                                "type": "integer",
-                                "description": "Ano da análise."
-                            },
-                            "meses": {
-                                "type": "array",
-                                "items": {"type": "integer"},
-                                "description": "Lista de meses."
-                            }
-                        },
-                        "required": ["terminal_sigla", "ano"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "plotar_grafico",
-                    "description": "Gera um gráfico visual. Use quando o usuário pedir gráfico, plot, linha, barra, pizza ou rosca.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "tipo_grafico": {
-                                "type": "string",
-                                "enum": ["linha", "barra", "pizza", "rosca"],
-                                "description": "Tipo do gráfico."
-                            },
-                            "tema": {
-                                "type": "string",
-                                "enum": ["market_share", "evolucao_mensal"],
-                                "description": "Tema do gráfico."
-                            },
-                            "anos": {
-                                "type": "array",
-                                "items": {"type": "integer"},
-                                "description": "Lista de anos da análise."
-                            },
-                            "terminal_sigla": {
-                                "type": "string",
-                                "description": "Sigla do terminal ou 'PORTO'."
-                            }
-                        },
-                        "required": ["tipo_grafico"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_data_coverage",
-                    "description": "Retorna a fonte ativa, a cobertura temporal da base e o diagnóstico do carregamento.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {}
+                        "required": ["metric"]
                     }
                 }
             }
         ]
 
-    def _get_latest_complete_year(self):
-        meses_por_ano = self.df.groupby("ANO")["MES"].nunique()
-        anos_completos = meses_por_ano[meses_por_ano >= 12]
-        if anos_completos.empty:
-            return None
-        return int(anos_completos.index.max())
-
-    def _has_explicit_year(self, text: str) -> bool:
-        return bool(re.search(r"\b20\d{2}\b", text))
-
-    def _looks_like_quant_question(self, text: str) -> bool:
-        text = text.lower()
-        keywords = [
-            "market share", "moviment", "teu", "volume", "crescimento",
-            "mix", "terminal", "porto", "carga", "dpw", "sbsa", "btp"
-        ]
-        return any(k in text for k in keywords)
-
-    def _augment_query_with_default_period(self, user_query: str) -> str:
-        if self._has_explicit_year(user_query):
-            return user_query
-
-        if not self._looks_like_quant_question(user_query):
-            return user_query
-
-        if len(self.latest_months) < 12:
-            return (
-                user_query
-                + f"\n\nREGRA DE PERÍODO PADRÃO: o usuário não informou o ano. "
-                  f"Use automaticamente o período mais recente disponível na base: "
-                  f"{self.max_year}, meses {self.latest_months}. "
-                  f"Na resposta final, deixe explícito que se trata de período parcial/YTD."
-            )
-
-        return (
-            user_query
-            + f"\n\nREGRA DE PERÍODO PADRÃO: o usuário não informou o ano. "
-              f"Use automaticamente o ano mais recente completo da base: {self.max_year}."
-        )
+    def _update_context_from_args(self, args: dict):
+        """Atualiza a memória baseada na última ferramenta chamada"""
+        if args.get("start_date"): self.current_filters["start_date"] = args["start_date"]
+        if args.get("end_date"): self.current_filters["end_date"] = args["end_date"]
+        if args.get("terminals"): self.current_filters["terminals"] = args["terminals"]
+        if args.get("metric"): self.current_filters["metric"] = args["metric"]
 
     def get_status_summary(self) -> str:
-        return get_data_coverage_text(self.data_coverage, self.data_diagnostics)
-
-    def ask(self, user_query: str, context: str = "") -> str:
-        effective_query = self._augment_query_with_default_period(user_query)
-
-        messages = [
-            {"role": "system", "content": self.system_prompt}
-        ]
-
-        if context:
-            messages.append({
-                "role": "system",
-                "content": f"Contexto recente da conversa:\n{context}"
-            })
-
-        messages.append({"role": "user", "content": effective_query})
-
-        response = self.client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages,
-            tools=self.tools,
-            tool_choice="auto"
+        """Retorna o resumo da saúde dos dados para a interface do Streamlit"""
+        if not hasattr(self, 'data_coverage') or not self.data_coverage:
+            return "Nenhum dado carregado."
+        
+        cov = self.data_coverage
+        return (
+            f"✅ **Base Ativa**\n"
+            f"- Período: {cov.min_year} a {cov.max_year}-{cov.max_month:02d}\n"
+            f"- Registros: {cov.row_count:,}\n"
+            f"- Atualizado em: {cov.loaded_at}"
         )
 
+    def ask(self, question: str, context: str = "") -> str:
+        if not self.client:
+            return "Erro: cliente OpenAI não configurado para o Agente de Dados."
+
+        # Injete as variáveis de contexto ao invés de mensagens inteiras
+        max_y = self.data_coverage.max_year
+        max_m = self.data_coverage.max_month
+        mix_list = ", ".join([str(x) for x in self.data_coverage.cargo_mix_list]) if self.data_coverage.cargo_mix_list else "Não identificados"
+
+        system_prompt = f"""
+        Você é o Analista de Dados do Porto.
+        
+        [COBERTURA DE DADOS]
+        Você tem dados carregados até: {max_y}-{max_m:02d} (Este é o "mês atual" ou "último mês disponível").
+        Cargo Mix disponíveis nesta base: {mix_list}
+        
+        [REGRAS DE TEMPO RELATIVO - EXTREMAMENTE IMPORTANTE]
+        1. Omissão de data: Se o usuário pedir algo genérico (ex: "Qual o volume da BTP?"), assuma automaticamente o mês mais recente ({max_y}-{max_m:02d}) configurando `start_date` e `end_date` para este mês.
+        2. "Último mês": Use `start_date` e `end_date` cobrindo o mês {max_y}-{max_m:02d}.
+        3. "Último ano": Avalie o contexto. Pode ser o ano cheio de {max_y} ou, se estivermos no começo do ano, o ano consolidado de {max_y - 1}.
+        
+        [REGRAS DE COMPARAÇÃO - YoY / MoM]
+        Para calcular o crescimento ou comparar períodos, você DEVE buscar os dois períodos na ferramenta definindo o `start_date` e `end_date` de forma abrangente e ativando `compare_with_previous=True`.
+        - Exemplo YoY (Year-over-Year): Para comparar o último mês com o mesmo mês do ano anterior, defina start_date='{max_y-1}-{max_m:02d}-01', end_date='{max_y}-{max_m:02d}-31' e group_by='mes' ou 'ano'.
+        - Não tente fazer a matemática sozinho; deixe a ferramenta agregar agrupando pelo período.
+        
+        [CONTEXTO DA CONVERSA ATUAL]
+        Data Inicial foco: {self.current_filters['start_date'] or 'Não definida'}
+        Data Final foco: {self.current_filters['end_date'] or 'Não definida'}
+        Terminais: {', '.join(self.current_filters['terminals']) if self.current_filters['terminals'] else 'Todos'}
+        Métrica Ativa: {self.current_filters['metric']}
+
+        [REGRAS DE CARGO MIX - OBRIGATÓRIO]
+        1. A coluna de Cargo Mix chama-se "ESTADO". Os valores válidos exatos são: {mix_list}.
+        2. Se o usuário perguntar "quais os cargo mix", cite a lista acima diretamente sem usar ferramentas.
+        3. Se pedir sobre "remoção" ou "exportação", você DEVE acionar a ferramenta usando a propriedade `cargo_mix_filter` com o valor exato em MAIÚSCULO. Ex: `cargo_mix_filter=["REMOÇÃO"]`.
+        4. Se perguntar "Qual o share por cargo mix" ou "proporção", você DEVE acionar a ferramenta passando `group_by="cargo_mix"`.
+        5. Se o usuário pedir "mix de carga" de um terminal, responda os volumes detalhados usando group_by=["cargo_mix"].
+        6. CRUZAMENTOS: Se o usuário pedir "por terminal mês a mês", use group_by=["mes", "terminal"] juntos.
+        
+        [REGRAS DE TERMINAIS - OBRIGATÓRIO]
+        O usuário pode digitar o nome completo, mas você DEVE converter para a SIGLA OFICIAL ao usar o filtro 'terminals' da ferramenta:
+        - "Santos Brasil" -> "SBSA"
+        - "DP World" ou "Embraport" -> "DPW"
+        - "Brasil Terminal Portuário" -> "BTP"
+        - "Ecoporto" -> "ECOPORTO"
+        Se você enviar o nome por extenso (ex: "Santos Brasil") a ferramenta falhará.
+
+        [REGRAS DE MÉTRICAS E SHARE]
+        1. Se o usuário usar as palavras "SHARE", "PARTICIPAÇÃO", "PROPORÇÃO" ou "MIX", você DEVE obrigatoriamente usar metric="market_share".
+        2. O resultado voltará com uma coluna 'Share (%)'. Você deve priorizar a exibição deste valor percentual na sua resposta final.
+        3. Sempre que mostrar o Share, mencione também o volume absoluto (TEUs) logo ao lado para contexto.
+        4. Para "Cargo Mix", use sempre group_by="cargo_mix" e metric="market_share".
+        5. CÁLCULO DE YOY (Year-over-Year): Se o usuário pedir "Crescimento YoY por terminal" para um ano específico (ex: 2026), defina compare_with_previous=True, start_date="2025-01-01" (ano anterior) e use group_by=["terminal", "ano"]. A ferramenta já ajustará os meses automaticamente para uma comparação justa.
+"""
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": question}
+        ]
+
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            tools=self.tools,
+            temperature=0.0
+        )
         response_message = response.choices[0].message
 
-        if response_message.tool_calls:
-            messages.append(response_message)
+        if not response_message.tool_calls:
+            return response_message.content or ""
 
-            for tool_call in response_message.tool_calls:
-                function_name = tool_call.function.name
-                function_args = json.loads(tool_call.function.arguments or "{}")
+        messages.append(response_message)
+        for tool_call in response_message.tool_calls:
+            function_name = tool_call.function.name
+            raw_args = json.loads(tool_call.function.arguments)
 
-                print(
-                    f"⚙️ [DataAgent] Executando tool: {function_name} "
-                    f"com argumentos: {function_args}"
-                )
+            print(f"\n📊 [DATA AGENT] Executando Pandas: {function_name}")
+            print(f"⚙️ [FILTROS] Argumentos: {json.dumps(raw_args, indent=2, ensure_ascii=False)}")
+            
+            # Atualiza a memória para futuras interações!
+            self._update_context_from_args(raw_args)
 
-                if function_name == "get_volume":
-                    tool_result = get_volume(
-                        self.df,
-                        function_args.get("terminal_sigla"),
-                        function_args.get("ano"),
-                        function_args.get("meses")
-                    )
-
-                elif function_name == "get_market_share":
-                    tool_result = get_market_share(
-                        self.df,
-                        function_args.get("ano"),
-                        function_args.get("terminal_sigla"),
-                        function_args.get("meses")
-                    )
-
-                elif function_name == "get_growth":
-                    tool_result = get_growth(
-                        self.df,
-                        function_args.get("terminal_sigla", "PORTO"),
-                        function_args.get("ano_base"),
-                        function_args.get("ano_comparacao"),
-                        function_args.get("meses_base"),
-                        function_args.get("meses_comparacao"),
-                        function_args.get("cargo_mix")
-                    )
-
-                elif function_name == "get_cargo_mix":
-                    tool_result = get_cargo_mix(
-                        self.df,
-                        function_args.get("terminal_sigla", "PORTO"),
-                        function_args.get("ano"),
-                        function_args.get("meses")
-                    )
-
-                elif function_name == "plotar_grafico":
-                    tool_result = plotar_grafico(
-                        self.df,
-                        function_args.get("tipo_grafico"),
-                        function_args.get("tema"),
-                        function_args.get("anos"),
-                        function_args.get("terminal_sigla", "PORTO")
-                    )
-
-                elif function_name == "get_data_coverage":
-                    tool_result = get_data_coverage_text(
-                        self.data_coverage,
-                        self.data_diagnostics
-                    )
-
+            try:
+                if function_name == "query_port_data":
+                    tool_result = query_port_data(self.df, **raw_args)
                 else:
-                    tool_result = "Erro: ferramenta não encontrada."
+                    tool_result = f"Ferramenta {function_name} não encontrada."
+            except Exception as exc:
+                tool_result = f"Erro ao executar a consulta: {exc}"
 
-                messages.append({
-                    "tool_call_id": tool_call.id,
-                    "role": "tool",
-                    "name": function_name,
-                    "content": str(tool_result)
-                })
+            messages.append({
+                "tool_call_id": tool_call.id,
+                "role": "tool",
+                "name": function_name,
+                "content": str(tool_result),
+            })
 
-            final_response = self.client.chat.completions.create(
-                model="gpt-4o",
-                messages=messages
-            )
+        final_response = self.client.chat.completions.create(model=self.model_name, messages=messages)
+        return final_response.choices[0].message.content or ""
 
-            return final_response.choices[0].message.content or ""
-
-        return response_message.content or ""
-
-
-if __name__ == "__main__":
-    agente = PortDataAgent()
-
-    pergunta = "Qual a movimentação da SBSA em dezembro de 2023?"
-    print(f"\nUsuário: {pergunta}")
-
-    resposta = agente.ask(pergunta)
-    print(f"\nAgente: {resposta}")
+    def clear_last_generated_chart(self):
+        self.last_generated_chart_path = None
