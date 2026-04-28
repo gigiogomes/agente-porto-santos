@@ -114,7 +114,7 @@ def _normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             df["TIPO_NAVEGACAO"] == "CABOTAGEM",
             df["SENTIDO"] == "DESEMBARQUE"
         ]
-        escolhas = ["RESTOW", "TRANSBORDO", "CABOTAGEM", "IMPORTACAO"]
+        escolhas = ["REMOÇÃO", "TRANSBORDO", "CABOTAGEM", "IMPORTACAO"]
         fluxo = np.select(condicoes, escolhas, default="EXPORTACAO")
 
         # 3. Mescla e salva na coluna "ESTADO" (substituindo a antiga)
