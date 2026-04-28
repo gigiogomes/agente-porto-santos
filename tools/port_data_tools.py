@@ -109,12 +109,12 @@ def _normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
         # 2. Fluxo em Cascata (if... else if...) do Power Query
         condicoes = [
-            df["MOVIMENTO"] == "REMOÇÃO",
+            df["MOVIMENTO"] == "REMOCAO",
             df["MOVIMENTO"] == "TRANSBORDO",
             df["TIPO_NAVEGACAO"] == "CABOTAGEM",
             df["SENTIDO"] == "DESEMBARQUE"
         ]
-        escolhas = ["REMOÇÃO", "TRANSBORDO", "CABOTAGEM", "IMPORTACAO"]
+        escolhas = ["REMOCAO", "TRANSBORDO", "CABOTAGEM", "IMPORTACAO"]
         fluxo = np.select(condicoes, escolhas, default="EXPORTACAO")
 
         # 3. Mescla e salva na coluna "ESTADO" (substituindo a antiga)
