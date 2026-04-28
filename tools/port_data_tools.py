@@ -216,8 +216,15 @@ def query_port_data(
         df_filtered = df_filtered[df_filtered['TERMINAL_SIGLA_CANONICA'].isin(terminals)]
         
     if cargo_mix_filter and len(cargo_mix_filter) > 0:
-        cm_upper = [str(c).upper() for c in cargo_mix_filter]
-        df_filtered = df_filtered[df_filtered['ESTADO'].astype(str).str.upper().isin(cm_upper)]
+        filtros_norm = [_normalize_text(c) for c in cargo_mix_filter]
+        estado_norm = df_filtered["ESTADO"].apply(_normalize_text)
+        mask = pd.Series(False, index=df_filtered.index)
+        for filtro in filtros_norm:
+            if filtro in ["REMOCAO", "TRANSBORDO", "CABOTAGEM", "IMPORTACAO", "EXPORTACAO"]:
+                mask |= estado_norm.str.startswith(filtro + " ")
+            else:
+                mask |= estado_norm.eq(filtro)
+        df_filtered = df_filtered[mask]
         
     if df_filtered.empty:
         return f"[AVISO DO SISTEMA] Nenhum dado encontrado. Filtros usados: Terminais={terminals}, CargoMix={cargo_mix_filter}, Periodo={start_date} a {end_date}. O bot deve informar isso ao usuário."
