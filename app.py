@@ -1,18 +1,20 @@
+import logging
 import os
 import sys
 import uuid
-from typing import Optional
 
 import streamlit as st
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(BASE_DIR)
 
 try:
-    from agent.coordinator_agent import CoordinatorAgent
+    from agent.coordinator_agent import CoordinatorAgent, default_filters
 except ImportError:
-    from coordinator_agent import CoordinatorAgent
-
+    from coordinator_agent import CoordinatorAgent, default_filters
 
 st.set_page_config(
     page_title="Assistente do Porto de Santos",
@@ -20,107 +22,82 @@ st.set_page_config(
     layout="centered",
 )
 
-# ==========================================
-# 1. A MÁGICA DO CACHE ACONTECE AQUI
-# ==========================================
+
+# ============================================================== #
+# Recursos pesados e IMUTÁVEIS, criados uma única vez e
+# compartilhados entre sessões com segurança (base de dados,
+# índice vetorial, clientes). NENHUMA memória de conversa vive
+# aqui — ela fica em st.session_state, por usuário.
+# ============================================================== #
 @st.cache_resource
-def get_global_coordinator():
-    # Usamos um ID fixo para o agente. Assim o servidor cria a base pesada UMA única vez
-    # e a reaproveita, evitando estourar a memória a cada F5 (refresh) na página.
-    return CoordinatorAgent(session_id="sessao_global_porto")
+def get_global_coordinator() -> CoordinatorAgent:
+    return CoordinatorAgent(session_id="recursos_compartilhados_porto")
 
-
-st.title("🚢 Assistente de IA - Porto de Santos")
-st.markdown(
-    """
-Bem-vindo! Sou um agente especialista na movimentação de cargas do porto.
-Você pode me perguntar sobre **market share, crescimento, mix de cargas, volumes (TEUs)**
-e também sobre temas qualitativos, caso o knowledge agent esteja disponível.
-"""
-)
 
 def init_session_state() -> None:
     if "session_id" not in st.session_state:
         st.session_state.session_id = uuid.uuid4().hex
-
     if "messages" not in st.session_state:
-        st.session_state.messages = []
-
+        st.session_state.messages = []          # histórico exibido na tela
+    if "history" not in st.session_state:
+        st.session_state.history = []           # memória de conversa do LLM
+    if "data_filters" not in st.session_state:
+        st.session_state.data_filters = default_filters()  # filtros do analista
     if "coordinator" not in st.session_state:
-        with st.spinner("Inicializando agentes e carregando base de dados (Isso ocorre apenas uma vez)..."):
-            # 2. Chamamos o agente blindado pelo cache
+        with st.spinner(
+            "Inicializando agentes e carregando base de dados (apenas uma vez)..."
+        ):
             st.session_state.coordinator = get_global_coordinator()
 
-def rebuild_coordinator(clear_messages: bool = False) -> None:
-    with st.spinner("Recarregando agentes e base de dados..."):
-        if not clear_messages:
-            # Se for recarregar o banco de dados/agentes (botão 🔄)
-            get_global_coordinator.clear() # Limpa a memória do servidor
-            st.session_state.coordinator = get_global_coordinator()
 
-    if clear_messages:
-        # Se for apenas limpar o chat (botão 🧹)
-        st.session_state.messages = []
-        try:
-            st.session_state.coordinator.reset_memory()
-        except Exception:
-            pass
+def start_new_conversation() -> None:
+    """Reset real da conversa: limpa a tela, a memória do LLM e os filtros — só desta sessão."""
+    st.session_state.messages = []
+    st.session_state.history = []
+    st.session_state.data_filters = default_filters()
+
+
+def reload_shared_resources() -> None:
+    """Recarrega os recursos pesados compartilhados (afeta todas as sessões)."""
+    get_global_coordinator.clear()
+    st.session_state.coordinator = get_global_coordinator()
 
 
 def render_sidebar() -> None:
     st.sidebar.header("Controles")
 
-    if st.sidebar.button("🔄 Recarregar dados e agentes"):
-        rebuild_coordinator(clear_messages=False)
+    if st.sidebar.button("🧹 Nova conversa"):
+        start_new_conversation()
         st.rerun()
 
-    if st.sidebar.button("🧹 Nova conversa"):
-        rebuild_coordinator(clear_messages=True)
+    if st.sidebar.button("🔄 Recarregar dados e agentes"):
+        with st.spinner("Recarregando base de dados e agentes..."):
+            reload_shared_resources()
         st.rerun()
 
     st.sidebar.divider()
     st.sidebar.subheader("Status do sistema")
 
     coordinator = st.session_state.coordinator
+    try:
+        st.sidebar.code(coordinator.data_agent.get_status_summary(), language="text")
+    except Exception:
+        logger.exception("Erro ao obter status dos dados.")
+        st.sidebar.error("Não foi possível obter o status dos dados.")
 
     try:
-        data_status = coordinator.data_agent.get_status_summary()
-        st.sidebar.code(data_status, language="text")
-    except Exception as exc:
-        st.sidebar.error(f"Erro ao obter status dos dados: {exc}")
-
-    try:
-        st.sidebar.write(f"**Knowledge agent:** {coordinator.knowledge_agent.status_message}")
-    except Exception as exc:
-        st.sidebar.error(f"Erro ao obter status do knowledge agent: {exc}")
+        st.sidebar.write(
+            f"**Knowledge agent:** {coordinator.knowledge_agent.status_message}"
+        )
+    except Exception:
+        logger.exception("Erro ao obter status do knowledge agent.")
+        st.sidebar.error("Não foi possível obter o status do knowledge agent.")
 
 
 def render_chat_history() -> None:
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
-            if message.get("image"):
-                st.image(message["image"])
-
-
-def _read_generated_chart_bytes(chart_path: Optional[str]) -> Optional[bytes]:
-    if not chart_path:
-        return None
-
-    if not os.path.exists(chart_path):
-        return None
-
-    try:
-        with open(chart_path, "rb") as file_obj:
-            image_bytes = file_obj.read()
-        return image_bytes
-    except Exception:
-        return None
-    finally:
-        try:
-            os.remove(chart_path)
-        except OSError:
-            pass
 
 
 def process_user_message(user_input: str) -> None:
@@ -128,43 +105,50 @@ def process_user_message(user_input: str) -> None:
 
     with st.chat_message("user"):
         st.markdown(user_input)
-
     st.session_state.messages.append({"role": "user", "content": user_input})
 
     with st.chat_message("assistant"):
         with st.spinner("Analisando..."):
             try:
-                coordinator.data_agent.clear_last_generated_chart()
-                response_text = coordinator.chat(user_input)
-                chart_path = coordinator.data_agent.last_generated_chart_path
-            except Exception as exc:
-                response_text = (
-                    "Ocorreu um erro ao processar a sua solicitação.\n\n"
-                    f"Detalhe técnico: {exc}"
+                response_text, updated_history, updated_filters = coordinator.chat(
+                    user_input,
+                    history=st.session_state.history,
+                    data_filters=st.session_state.data_filters,
                 )
-                chart_path = None
-
+                # Persiste o estado atualizado da sessão.
+                st.session_state.history = updated_history
+                st.session_state.data_filters = updated_filters
+            except Exception:
+                logger.exception("Erro inesperado ao processar a mensagem do usuário.")
+                response_text = (
+                    "Ocorreu um erro inesperado ao processar a sua solicitação. "
+                    "Tente novamente em instantes."
+                )
         st.markdown(response_text)
 
-        image_bytes = _read_generated_chart_bytes(chart_path)
-        if image_bytes:
-            st.image(image_bytes)
-
     st.session_state.messages.append(
-        {
-            "role": "assistant",
-            "content": response_text,
-            "image": image_bytes,
-        }
+        {"role": "assistant", "content": response_text}
     )
 
 
 def main() -> None:
     try:
         init_session_state()
-    except Exception as exc:
-        st.error(f"Falha ao inicializar o sistema: {exc}")
+    except Exception:
+        logger.exception("Falha ao inicializar o sistema.")
+        st.error(
+            "Falha ao inicializar o sistema. Verifique as configurações e tente novamente."
+        )
         st.stop()
+
+    st.title("🚢 Assistente de IA - Porto de Santos")
+    st.markdown(
+        """
+        Bem-vindo! Sou um agente especialista na movimentação de cargas do porto.
+        Você pode me perguntar sobre **market share, crescimento, mix de cargas, volumes (TEUs)**
+        e também sobre temas qualitativos, caso o knowledge agent esteja disponível.
+        """
+    )
 
     render_sidebar()
     render_chat_history()
