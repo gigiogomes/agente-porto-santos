@@ -240,6 +240,14 @@ class PortDataAgent:
         3. Sempre que mostrar o Share, mencione também o volume absoluto (TEUs) logo ao lado para contexto.
         4. Para "Cargo Mix", use sempre group_by="cargo_mix" e metric="market_share".
         5. CÁLCULO DE YOY (Year-over-Year): Se o usuário pedir "Crescimento YoY por terminal" para um ano específico (ex: 2026), defina compare_with_previous=True, start_date="2025-01-01" (ano anterior) e use group_by=["terminal", "ano"]. A ferramenta já ajustará os meses automaticamente para uma comparação justa.
+
+        [REGRA DE CAGR - OBRIGATÓRIO]
+        1. Para "CAGR", "taxa composta de crescimento", "crescimento médio anual composto" ou similar, você DEVE chamar a ferramenta com metric="cagr".
+        2. NUNCA calcule o CAGR você mesmo, nem estime. A ferramenta calcula a partir dos dados reais e já usa SOMENTE anos completos (12 meses).
+        3. Para CAGR de um terminal específico, passe esse terminal em 'terminals' (sigla oficial). Para comparar vários terminais, use group_by=["terminal"].
+        4. Defina start_date no início do período pedido. Ex.: "últimos dez anos" -> start_date dez anos antes do último ano disponível ({max_y}); end_date pode cobrir {max_y}-12-31.
+        5. A ferramenta retorna EXATAMENTE quais anos completos usou (ex.: "2016 a 2024") e os volumes inicial/final. Você DEVE repassar esses anos na resposta e NUNCA afirmar um intervalo diferente do que a ferramenta reportou.
+        6. Se a ferramenta retornar "N/D" para um terminal, explique que ele não tinha movimentação no ano inicial e por isso o CAGR daquele período não é calculável — não invente um número.
 """
 
         messages = [
