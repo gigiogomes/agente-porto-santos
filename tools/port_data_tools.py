@@ -271,9 +271,81 @@ def _compute_cagr(
     result = pd.DataFrame(rows)
     note = (
         f"[CAGR calculado deterministicamente sobre anos completos: {first_year} a {last_year} "
-        f"({n} anos de variação). Os endpoints definem o CAGR; anos intermediários não alteram o cálculo.]\n"
+        f"({n} ano{'s' if n != 1 else ''} de variação). Os endpoints definem o CAGR; "
+        f"anos intermediários não alteram o cálculo.]\n"
     )
     return note + result.to_string(index=False)
+
+
+def _compute_yoy(df_filtered: pd.DataFrame, group_by, val_col: str) -> str:
+    """
+    YoY determinístico. Sempre separa os anos em COLUNAS (TEU ano_anterior /
+    TEU ano_atual / Diferença / YoY %), independentemente de o modelo ter
+    incluído 'ano' no group_by. Se o ano atual for parcial, faz a comparação
+    acumulada (YTD) e DIZ isso explicitamente, em vez de rotular silenciosamente
+    um valor parcial como se fosse o ano cheio.
+    """
+    years = sorted(int(y) for y in df_filtered["ANO"].unique())
+    if len(years) < 2:
+        return (
+            f"[AVISO DO SISTEMA] YoY precisa de dois anos na janela, mas só há: {years}. "
+            "O bot deve pedir um período que inclua o ano anterior e NÃO deve inventar valores."
+        )
+    curr, prev = years[-1], years[-2]
+
+    curr_max_month = int(df_filtered[df_filtered["ANO"] == curr]["MES"].max())
+    full_year = curr_max_month >= 12
+
+    # Comparação justa: limita ambos os anos aos meses disponíveis no ano atual.
+    dft = df_filtered[
+        (df_filtered["ANO"].isin([prev, curr])) & (df_filtered["MES"] <= curr_max_month)
+    ]
+
+    gb = [group_by] if isinstance(group_by, str) else (group_by or [])
+    dim_cols = []
+    for g in gb:
+        if g == "terminal":
+            dim_cols.append("TERMINAL_SIGLA_CANONICA")
+        elif g == "cargo_mix":
+            dim_cols.append("ESTADO")
+        # group_by temporais (ano/mes/...) são ignorados: o YoY já é por ano.
+
+    if dim_cols:
+        grouped = dft.groupby(dim_cols + ["ANO"])[val_col].sum().reset_index()
+        pivot = grouped.pivot_table(
+            index=dim_cols, columns="ANO", values=val_col, fill_value=0
+        ).reset_index()
+    else:
+        s = dft.groupby("ANO")[val_col].sum()
+        pivot = pd.DataFrame([{prev: float(s.get(prev, 0)), curr: float(s.get(curr, 0))}])
+
+    for y in (prev, curr):
+        if y not in pivot.columns:
+            pivot[y] = 0.0
+
+    pivot["Diferença"] = (pivot[curr] - pivot[prev]).round(0).astype(int)
+    pivot["YoY (%)"] = pivot.apply(
+        lambda r: f"{round((r[curr] / r[prev] - 1) * 100, 2)}%"
+        if r[prev] > 0
+        else "N/D (sem base no ano anterior)",
+        axis=1,
+    )
+    pivot[prev] = pivot[prev].round(0).astype(int)
+    pivot[curr] = pivot[curr].round(0).astype(int)
+    pivot = pivot.rename(columns={prev: f"TEU {prev}", curr: f"TEU {curr}"})
+
+    if dim_cols:
+        pivot = pivot.sort_values(by=f"TEU {curr}", ascending=False)
+
+    if full_year:
+        note = f"[YoY ano cheio: {prev} vs {curr}.]\n"
+    else:
+        note = (
+            f"[YoY ACUMULADO/YTD: meses 1 a {curr_max_month}. O ano {curr} só tem dados até o mês "
+            f"{curr_max_month}, então {prev} também foi limitado aos meses 1 a {curr_max_month} para "
+            f"comparação justa. ATENÇÃO: estes NÃO são valores de ano cheio — informe isso ao usuário.]\n"
+        )
+    return note + pivot.to_string(index=False)
 
 
 def query_port_data(
@@ -323,12 +395,10 @@ def query_port_data(
     # 3. Definição da Coluna de Métrica Base
     val_col = "TOTAL_TEU" if metric in ["teus", "market_share"] else "TOTAL_UNID"
 
-    if compare_with_previous and not df_filtered.empty:
-        max_year = df_filtered["ANO"].max()
-        max_month = df_filtered[df_filtered["ANO"] == max_year]["MES"].max()
-
-        if pd.notna(max_month):
-            df_filtered = df_filtered[df_filtered["MES"] <= max_month]
+    # 3.5 YoY é determinístico: pivota por ano em colunas e rotula a base
+    # (acumulado/YTD vs ano cheio). Retorna sem cair no fluxo genérico de soma.
+    if compare_with_previous:
+        return _compute_yoy(df_filtered, group_by, val_col)
 
     # 4. Agrupamento Múltiplo (Tabela Dinâmica)
     groupby_cols = []
@@ -352,19 +422,7 @@ def query_port_data(
         aggregated = pd.DataFrame([{"Total": df_filtered[val_col].sum()}])
         val_col = "Total"
 
-    # 5. Cálculo de Crescimento / Variação Percentual
-    if compare_with_previous and not aggregated.empty:
-        aggregated = aggregated.sort_values(by=groupby_cols)
-
-        if len(groupby_cols) > 1 and "ANO" in groupby_cols:
-            cols_except_year = [c for c in groupby_cols if c != "ANO"]
-            aggregated["Crescimento (%)"] = aggregated.groupby(cols_except_year)[val_col].pct_change() * 100
-        else:
-            aggregated["Crescimento (%)"] = aggregated[val_col].pct_change() * 100
-
-        aggregated["Crescimento (%)"] = aggregated["Crescimento (%)"].round(2).fillna(0).astype(str) + "%"
-
-    # 6. Cálculo de Share / Proporção Percentual
+    # 5. Cálculo de Share / Proporção Percentual
     if metric == "market_share":
         total_geral = aggregated[val_col].sum()
         if total_geral > 0:
