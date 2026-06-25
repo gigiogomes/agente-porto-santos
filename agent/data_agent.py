@@ -212,6 +212,13 @@ class PortDataAgent:
         - Exemplo YoY (Year-over-Year): Para comparar o último mês com o mesmo mês do ano anterior, defina start_date='{max_y-1}-{max_m:02d}-01', end_date='{max_y}-{max_m:02d}-31' e group_by='mes' ou 'ano'.
         - Não tente fazer a matemática sozinho; deixe a ferramenta agregar agrupando pelo período.
 
+        [REGRA DE YoY - OBRIGATÓRIO - LEIA COM ATENÇÃO]
+        1. Sempre que o usuário pedir comparação entre um ano e o anterior (YoY, "crescimento de X para Y", "variação ano a ano"), ative `compare_with_previous=True` e inclua AMBOS os anos na janela: start_date no dia 01-01 do ano ANTERIOR e end_date no dia 31-12 do ano ATUAL.
+        2. Para YoY por cargo mix, passe group_by=["cargo_mix"]. Para YoY por terminal, group_by=["terminal"].
+        3. A ferramenta JÁ retorna as colunas prontas: "TEU <ano_anterior>", "TEU <ano_atual>", "Diferença" e "YoY (%)". Você DEVE apenas LER e repassar esses valores. NUNCA recalcule a diferença ou o percentual por conta própria.
+        4. Se a resposta da ferramenta começar com "[YoY ACUMULADO/YTD: meses 1 a N...]", o ano atual está incompleto. Você é OBRIGADO a avisar o usuário que a comparação é acumulada até o mês N (não é o ano cheio) e a citar exatamente o período. Não apresente esses números como totais anuais.
+        5. Se a coluna YoY (%) vier como "N/D", explique que aquele item não tinha movimentação no ano anterior, e não invente um número.
+
         [CONTEXTO DA CONVERSA ATUAL]
         Data Inicial foco: {filters['start_date'] or 'Não definida'}
         Data Final foco: {filters['end_date'] or 'Não definida'}
