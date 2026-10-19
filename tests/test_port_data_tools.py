@@ -108,12 +108,21 @@ def test_toneladas_considera_o_porto_inteiro_e_descreve_o_escopo(store_misto):
     assert out.startswith("[Escopo: medida=Toneladas; naturezas=todas]")
 
 
-def test_mercadoria_nome_exato_ou_parcial(store_misto):
-    exato = pdt.query_port_data(store_misto, metric="toneladas", mercadorias=["Soja em grãos"])
-    parcial = pdt.query_port_data(store_misto, metric="toneladas", mercadorias=["soja"])
-    assert exato.split()[-1] == "5000"
-    assert parcial.split()[-1] == "7000"
-    assert "FARELO DE SOJA" in parcial
+def test_mercadoria_por_trecho_do_nome(store_misto):
+    graos = pdt.query_port_data(store_misto, metric="toneladas", mercadorias=["Soja em grãos"])
+    soja = pdt.query_port_data(store_misto, metric="toneladas", mercadorias=["soja"])
+    assert graos.split()[-1] == "5000"
+    assert soja.split()[-1] == "7000"
+    assert "FARELO DE SOJA" in soja
+
+
+def test_mercadoria_generica_traz_a_familia_inteira():
+    rows = [
+        {"ano": 2025, "mes": 1, "terminal": "TIPLAM", "natureza": "GRANEL SOLIDO", "mercadoria": m, "ton": t}
+        for m, t in [("FERTILIZANTES", "10"), ("FERTILIZANTES POTÁSSICOS", "100"), ("FERTILIZANTES FOSFATADOS", "1.000")]
+    ]
+    out = pdt.query_port_data(make_store(rows), metric="toneladas", mercadorias=["fertilizantes"])
+    assert out.split()[-1] == "1110"
 
 
 def test_mercadoria_inexistente_lista_as_validas(store_misto):

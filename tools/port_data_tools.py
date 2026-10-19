@@ -213,12 +213,15 @@ def _parse_month_bound(value: str, is_end: bool) -> pd.Timestamp:
 
 
 def _resolve_mercadorias(store: PortDataStore, filtros: List[str]) -> List[str]:
-    """Nome exato quando existe; senão todas as mercadorias que contêm o termo ('SOJA')."""
+    """
+    Todas as mercadorias que contêm o termo. 'FERTILIZANTES' traz a família
+    inteira (fosfatados, potássicos...), e não só a categoria genérica de mesmo
+    nome; 'SOJA EM GRAOS' continua trazendo só os grãos.
+    """
     resolved = []
     for filtro in filtros:
         termo = normalize_text(filtro)
-        matches = [termo] if termo in store.mercadorias else [m for m in store.mercadorias if termo and termo in m]
-        resolved.extend(m for m in matches if m not in resolved)
+        resolved.extend(m for m in store.mercadorias if termo and termo in m and m not in resolved)
     return resolved
 
 

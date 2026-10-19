@@ -3,7 +3,6 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -13,8 +12,14 @@ logger = logging.getLogger(__name__)
 
 
 class KnowledgeAgent:
+    """
+    Busca semântica nos documentos de docs/ (RAG). Devolve os trechos mais
+    relevantes para a pergunta; quem escreve a resposta é o agente principal,
+    que recebe estes trechos como resultado da ferramenta `buscar_documentos`.
+    """
+
     def __init__(self, docs_dir: str = "docs", persist_dir: str = "chroma_db"):
-        logger.info("Iniciando Agente de Conhecimento (RAG)...")
+        logger.info("Iniciando busca em documentos (RAG)...")
 
         self.docs_dir = docs_dir
         self.persist_dir = persist_dir
@@ -23,7 +28,6 @@ class KnowledgeAgent:
         self.ready = False
         self.status_message = "Não inicializado"
         self.vector_store = None
-        self.rag_chain = None
 
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -31,19 +35,14 @@ class KnowledgeAgent:
             return
 
         try:
-            from langchain_classic.chains import create_retrieval_chain
-            from langchain_classic.chains.combine_documents import create_stuff_documents_chain
             from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader, TextLoader
-            
-            # --- NOVA IMPORTAÇÃO DO CHROMA COM FALLBACK ---
+
             try:
                 from langchain_chroma import Chroma
             except ImportError:
                 from langchain_community.vectorstores import Chroma
-            # ----------------------------------------------
-            
-            from langchain_core.prompts import ChatPromptTemplate
-            from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+            from langchain_openai import OpenAIEmbeddings
             from langchain_text_splitters import RecursiveCharacterTextSplitter
         except Exception as exc:
             self.status_message = f"Indisponível: dependências do RAG ausentes ({exc})."
@@ -53,16 +52,12 @@ class KnowledgeAgent:
         self._TextLoader = TextLoader
         self._PyPDFLoader = PyPDFLoader
         self._Chroma = Chroma
-        self._ChatPromptTemplate = ChatPromptTemplate
         self._RecursiveCharacterTextSplitter = RecursiveCharacterTextSplitter
-        self._create_retrieval_chain = create_retrieval_chain
-        self._create_stuff_documents_chain = create_stuff_documents_chain
 
         try:
             self.embeddings = OpenAIEmbeddings(api_key=api_key)
-            self.llm = ChatOpenAI(model=os.getenv("KNOWLEDGE_AGENT_MODEL", "gpt-4o"), temperature=0)
         except Exception as exc:
-            self.status_message = f"Falha ao inicializar embeddings/LLM: {exc}"
+            self.status_message = f"Falha ao inicializar embeddings: {exc}"
             return
 
         self.vector_store = self._init_or_load_db()
@@ -70,20 +65,6 @@ class KnowledgeAgent:
             if self.status_message == "Não inicializado":
                 self.status_message = "Sem documentos válidos para indexação."
             return
-
-        retriever = self.vector_store.as_retriever(search_kwargs={"k": 4})
-        system_prompt = (
-            "Você é o Agente de Conhecimento do Porto de Santos. "
-            "Responda perguntas qualitativas usando apenas o contexto recuperado. "
-            "Se a resposta não estiver nos documentos, diga isso claramente.\n\n"
-            "Contexto recuperado:\n{context}"
-        )
-
-        prompt = self._ChatPromptTemplate.from_messages(
-            [("system", system_prompt), ("human", "{input}")]
-        )
-        question_answer_chain = self._create_stuff_documents_chain(self.llm, prompt)
-        self.rag_chain = self._create_retrieval_chain(retriever, question_answer_chain)
 
         self.ready = True
         self.status_message = "Operacional"
@@ -183,24 +164,27 @@ class KnowledgeAgent:
             self.status_message = f"Erro ao carregar índice vetorial existente: {exc}"
             return None
 
-    def ask(self, question: str, context: str = "") -> str:
+    def search(self, query: str, k: int = 4) -> str:
+        """Trechos mais relevantes para a pergunta, identificados pelo arquivo de origem."""
         if not self.ready:
-            return f"Knowledge agent indisponível. Status: {self.status_message}"
-
-        full_question = question
-        if context:
-            full_question = f"Contexto recente:\n{context}\n\nPergunta atual:\n{question}"
+            return f"Busca em documentos indisponível. Status: {self.status_message}"
 
         try:
-            response = self.rag_chain.invoke({"input": full_question})
-            return response.get("answer", "Não foi possível gerar uma resposta.")
-        except Exception as exc:
-            return f"Erro ao consultar o knowledge agent: {exc}"
+            docs = self.vector_store.similarity_search(query, k=k)
+        except Exception:
+            logger.exception("Erro na busca em documentos.")
+            return "Erro ao buscar nos documentos."
+
+        if not docs:
+            return "Nenhum trecho relevante encontrado nos documentos."
+        return "\n\n".join(
+            f"[Trecho {i} - {Path(doc.metadata.get('source', '')).name}]\n{doc.page_content}"
+            for i, doc in enumerate(docs, 1)
+        )
 
 
 if __name__ == "__main__":
     agent = KnowledgeAgent()
     question = "Quais são os planos de investimento e expansão para o Porto de Santos?"
-    print(f"\nUsuário: {question}")
-    answer = agent.ask(question)
-    print(f"\nAgente RAG: {answer}")
+    print(f"\nPergunta: {question}")
+    print(f"\nTrechos:\n{agent.search(question)}")

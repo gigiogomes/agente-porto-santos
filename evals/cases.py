@@ -23,6 +23,8 @@ from evals.scoring import (
 )
 
 NAO = ["não"]
+MESES = ["", "janeiro", "fevereiro", "marco", "abril", "maio", "junho", "julho", "agosto",
+         "setembro", "outubro", "novembro", "dezembro"]
 EXPORTACAO = {"sentido": "EMBARQUE", "navegacao": "LONGO CURSO"}
 IMPORTACAO = {"sentido": "DESEMBARQUE", "navegacao": "LONGO CURSO"}
 
@@ -81,9 +83,14 @@ CASES = [
     Case("yoy_terminal_2025", "yoy", ["Qual foi o crescimento YoY de cada terminal em 2025?"],
          lambda o: {"percentuais": [o.yoy_pct(2024, 2025, terminais=[t]) for t in ("SBSA", "BTP", "DPW")]},
          [compara(), agrupa("terminal")], onde="resposta"),
+    # A resposta precisa deixar claro que 2026 está incompleto (comparação do
+    # mesmo período), qualquer que seja a formulação.
     Case("ytd_2026", "yoy", ["Como está a movimentação de TEUs de 2026 em relação a 2025?"],
          lambda o: {"percentuais": [o.yoy_pct(2025, 2026, ate_mes=o.max_month)]}, [compara()],
-         alguma_mencao=[["acumulad", "ytd", "parcia", "incomplet", "ate o mes", "janeiro a", "primeiros"]]),
+         alguma_mencao=lambda o: [[
+             "acumulad", "ytd", "parcia", "incomplet", "mesmo periodo", "ano completo", "ano cheio",
+             "primeiros", f"ate {MESES[o.max_month]}", f"janeiro a {MESES[o.max_month]}",
+         ]]),
     # Julho, e não agosto: em agosto a variação do mês coincide com a do acumulado
     # (3,88%), e o caso não distinguiria uma resposta errada de uma certa.
     Case("yoy_julho", "yoy", ["Compare julho de 2026 com julho de 2025 em TEUs."],

@@ -2,7 +2,7 @@
 Avaliação do agente com as perguntas de referência (evals/cases.py).
 
 Uso:
-    python -m evals.run --agente coordenador --label baseline
+    python -m evals.run --agente unico --label minha-mudanca
     python -m evals.run --agente unico --only share_terminal_2025,ytd_2026
 
 Faz chamadas reais ao LLM (precisa de OPENAI_API_KEY e custa tokens).
@@ -75,25 +75,29 @@ def _capturar_chamadas(modulos, chamadas: list):
             setattr(modulo, nome, envolvida)
 
 
-def montar_coordenador(chamadas: list):
-    """Arquitetura até a Fase 1: coordenador + analista de dados + agente de conhecimento."""
-    from agent import coordinator_agent, data_agent
+def montar_unico(chamadas: list):
+    """Agente único com ferramentas (Fase 2)."""
+    from agent import port_agent
 
-    agente = coordinator_agent.CoordinatorAgent()
-    _capturar_chamadas([data_agent], chamadas)
+    agente = port_agent.PortAgent()
+    _capturar_chamadas([port_agent], chamadas)
 
     def responder(turnos, antes_do_ultimo):
-        historico, filtros = [], None
+        historico = []
         for i, turno in enumerate(turnos):
             if i == len(turnos) - 1:
                 antes_do_ultimo()
-            texto, historico, filtros = agente.chat(turno, history=historico, data_filters=filtros)
-        return texto, []  # esta arquitetura não exibe tabelas além do texto
+            resposta = agente.responder_completo(turno, historico)
+            historico = resposta.historico
+        # As tabelas são exibidas ao usuário junto com o texto.
+        return resposta.texto, [r.texto("pt") for r in resposta.resultados]
 
-    return responder, agente.data_agent.store
+    return responder, agente.store
 
 
-AGENTES = {"coordenador": montar_coordenador}
+# O adaptador da arquitetura anterior (coordenador + analista) existiu até a
+# medição da linha de base; o histórico das rodadas está em evals/README.md.
+AGENTES = {"unico": montar_unico}
 
 
 def main(argv=None) -> int:

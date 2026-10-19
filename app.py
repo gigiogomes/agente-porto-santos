@@ -11,10 +11,8 @@ logger = logging.getLogger(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(BASE_DIR)
 
-try:
-    from agent.coordinator_agent import CoordinatorAgent, default_filters
-except ImportError:
-    from coordinator_agent import CoordinatorAgent, default_filters
+from agent.port_agent import USER_FACING_ERROR, PortAgent, Turno  # noqa: E402
+from tools.port_data_tools import load_port_data  # noqa: E402
 
 st.set_page_config(
     page_title="Assistente do Porto de Santos",
@@ -30,37 +28,33 @@ st.set_page_config(
 # aqui — ela fica em st.session_state, por usuário.
 # ============================================================== #
 @st.cache_resource
-def get_global_coordinator() -> CoordinatorAgent:
-    return CoordinatorAgent(session_id="recursos_compartilhados_porto")
+def get_agent() -> PortAgent:
+    return PortAgent()
 
 
 def init_session_state() -> None:
     if "session_id" not in st.session_state:
         st.session_state.session_id = uuid.uuid4().hex
     if "messages" not in st.session_state:
-        st.session_state.messages = []          # histórico exibido na tela
+        st.session_state.messages = []          # histórico exibido na tela (texto + tabelas)
     if "history" not in st.session_state:
         st.session_state.history = []           # memória de conversa do LLM
-    if "data_filters" not in st.session_state:
-        st.session_state.data_filters = default_filters()  # filtros do analista
-    if "coordinator" not in st.session_state:
-        with st.spinner(
-            "Inicializando agentes e carregando base de dados (apenas uma vez)..."
-        ):
-            st.session_state.coordinator = get_global_coordinator()
+    if "agent" not in st.session_state:
+        with st.spinner("Inicializando o agente e carregando a base de dados..."):
+            st.session_state.agent = get_agent()
 
 
 def start_new_conversation() -> None:
-    """Reset real da conversa: limpa a tela, a memória do LLM e os filtros — só desta sessão."""
+    """Reset real da conversa: limpa a tela e a memória do LLM — só desta sessão."""
     st.session_state.messages = []
     st.session_state.history = []
-    st.session_state.data_filters = default_filters()
 
 
 def reload_shared_resources() -> None:
-    """Recarrega os recursos pesados compartilhados (afeta todas as sessões)."""
-    get_global_coordinator.clear()
-    st.session_state.coordinator = get_global_coordinator()
+    """Recarrega dados e agente (afeta todas as sessões)."""
+    load_port_data.clear()  # sem isto, o agente novo receberia os dados antigos do cache
+    get_agent.clear()
+    st.session_state.agent = get_agent()
 
 
 def render_sidebar() -> None:
@@ -70,64 +64,68 @@ def render_sidebar() -> None:
         start_new_conversation()
         st.rerun()
 
-    if st.sidebar.button("🔄 Recarregar dados e agentes"):
-        with st.spinner("Recarregando base de dados e agentes..."):
+    if st.sidebar.button("🔄 Recarregar dados e agente"):
+        with st.spinner("Recarregando base de dados e agente..."):
             reload_shared_resources()
         st.rerun()
 
     st.sidebar.divider()
     st.sidebar.subheader("Status do sistema")
 
-    coordinator = st.session_state.coordinator
+    agent = st.session_state.agent
     try:
-        st.sidebar.code(coordinator.data_agent.get_status_summary(), language="text")
+        st.sidebar.code(agent.get_status_summary(), language="text")
     except Exception:
         logger.exception("Erro ao obter status dos dados.")
         st.sidebar.error("Não foi possível obter o status dos dados.")
 
-    try:
-        st.sidebar.write(
-            f"**Knowledge agent:** {coordinator.knowledge_agent.status_message}"
-        )
-    except Exception:
-        logger.exception("Erro ao obter status do knowledge agent.")
-        st.sidebar.error("Não foi possível obter o status do knowledge agent.")
+    st.sidebar.write(f"**Busca em documentos:** {agent.knowledge_agent.status_message}")
+
+
+def render_resultados(resultados) -> None:
+    """Tabelas das consultas, formatadas pelo código, com a procedência de cada uma."""
+    agent = st.session_state.agent
+    for resultado in resultados:
+        st.dataframe(resultado.tabela_exibicao(), hide_index=True, width="stretch")
+        st.caption(agent.procedencia(resultado))
 
 
 def render_chat_history() -> None:
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+            render_resultados(message.get("resultados", []))
 
 
 def process_user_message(user_input: str) -> None:
-    coordinator = st.session_state.coordinator
+    agent = st.session_state.agent
 
     with st.chat_message("user"):
         st.markdown(user_input)
     st.session_state.messages.append({"role": "user", "content": user_input})
 
     with st.chat_message("assistant"):
-        with st.spinner("Analisando..."):
-            try:
-                response_text, updated_history, updated_filters = coordinator.chat(
-                    user_input,
-                    history=st.session_state.history,
-                    data_filters=st.session_state.data_filters,
-                )
-                # Persiste o estado atualizado da sessão.
-                st.session_state.history = updated_history
-                st.session_state.data_filters = updated_filters
-            except Exception:
-                logger.exception("Erro inesperado ao processar a mensagem do usuário.")
-                response_text = (
-                    "Ocorreu um erro inesperado ao processar a sua solicitação. "
-                    "Tente novamente em instantes."
-                )
-        st.markdown(response_text)
+        fim = {}
+
+        def trechos_de_texto():
+            for evento, valor in agent.responder(user_input, st.session_state.history):
+                if evento == "texto":
+                    yield valor
+                else:
+                    fim["turno"] = valor
+
+        try:
+            st.write_stream(trechos_de_texto())
+            turno = fim["turno"]
+            st.session_state.history = turno.historico
+        except Exception:
+            logger.exception("Erro inesperado ao processar a mensagem do usuário.")
+            turno = Turno(USER_FACING_ERROR)
+            st.markdown(turno.texto)
+        render_resultados(turno.resultados)
 
     st.session_state.messages.append(
-        {"role": "assistant", "content": response_text}
+        {"role": "assistant", "content": turno.texto, "resultados": turno.resultados}
     )
 
 
