@@ -81,16 +81,16 @@ class PortDataAgent:
                             },
                             "start_date": {
                                 "type": "string",
-                                "description": "Data de início em YYYY-MM-DD. Ex: 2021-01-01",
+                                "description": "Mês inicial em YYYY-MM (YYYY-MM-DD também é aceito; o dia é ignorado). Ex: 2021-01",
                             },
                             "end_date": {
                                 "type": "string",
-                                "description": "Data final em YYYY-MM-DD. Ex: 2023-12-31",
+                                "description": "Mês final (inclusivo) em YYYY-MM (YYYY-MM-DD também é aceito; o dia é ignorado). Ex: 2023-12",
                             },
                             "terminals": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "description": "Lista de terminais. Deixe vazio para o porto inteiro.",
+                                "description": "Lista de terminais (siglas oficiais ou nomes da base). Deixe vazio para o porto inteiro.",
                             },
                             "cargo_mix_filter": {
                                 "type": "array",
@@ -160,8 +160,13 @@ class PortDataAgent:
             return "Nenhum dado carregado."
 
         cov = self.data_coverage
+        if cov.source_name == "APS":
+            source = "APS (endpoint oficial)"
+        else:
+            source = f"{cov.source_name} (cópia estática, pode estar desatualizada)"
         return (
             f"✅ **Base Ativa**\n"
+            f"- Fonte: {source}\n"
             f"- Período: {cov.min_year} a {cov.max_year}-{cov.max_month:02d}\n"
             f"- Registros: {cov.row_count:,}\n"
             f"- Atualizado em: {cov.loaded_at}"
@@ -194,6 +199,7 @@ class PortDataAgent:
             if self.data_coverage.cargo_mix_list
             else "Não identificados"
         )
+        terminal_list = ", ".join(self.data_coverage.terminal_list) or "Não identificados"
 
         system_prompt = f"""
         Você é o Analista de Dados do Porto.
@@ -234,12 +240,13 @@ class PortDataAgent:
         6. CRUZAMENTOS: Se o usuário pedir "por terminal mês a mês", use group_by=["mes", "terminal"] juntos.
 
         [REGRAS DE TERMINAIS - OBRIGATÓRIO]
-        O usuário pode digitar o nome completo, mas você DEVE converter para a SIGLA OFICIAL ao usar o filtro 'terminals' da ferramenta:
+        O usuário pode digitar o nome completo, mas prefira a SIGLA OFICIAL ao usar o filtro 'terminals' da ferramenta:
         - "Santos Brasil" -> "SBSA"
         - "DP World" ou "Embraport" -> "DPW"
         - "Brasil Terminal Portuário" -> "BTP"
         - "Ecoporto" -> "ECOPORTO"
-        Se você enviar o nome por extenso (ex: "Santos Brasil") a ferramenta falhará.
+        Valores existentes na base, do maior para o menor volume (inclui terminais históricos já desativados): {terminal_list}
+        Se o usuário citar um terminal que tem mais de um valor na lista (ex.: "Libra" -> "LIBRA 35", "LIBRA 37"), passe todos eles.
 
         [REGRAS DE MÉTRICAS E SHARE]
         1. Se o usuário usar as palavras "SHARE", "PARTICIPAÇÃO", "PROPORÇÃO" ou "MIX", você DEVE obrigatoriamente usar metric="market_share".
