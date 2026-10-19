@@ -13,6 +13,14 @@ sys.path.append(BASE_DIR)
 
 from agent.port_agent import USER_FACING_ERROR, PortAgent, Turno  # noqa: E402
 from tools.port_data_tools import load_port_data  # noqa: E402
+from ui.charts import visualizacao  # noqa: E402
+
+PERGUNTAS_SUGERIDAS = [
+    "Qual o market share por terminal em 2025?",
+    "Como está a movimentação de TEUs de 2026 em relação a 2025?",
+    "Quantas toneladas de soja em grãos foram exportadas em 2025?",
+    "Mostre a evolução anual de TEUs de 2015 a 2025.",
+]
 
 st.set_page_config(
     page_title="Assistente do Porto de Santos",
@@ -82,19 +90,58 @@ def render_sidebar() -> None:
     st.sidebar.write(f"**Busca em documentos:** {agent.knowledge_agent.status_message}")
 
 
-def render_resultados(resultados) -> None:
-    """Tabelas das consultas, formatadas pelo código, com a procedência de cada uma."""
+def _modo_do_tema() -> str:
+    try:
+        return st.context.theme.type or "light"
+    except Exception:
+        return "light"
+
+
+def render_resultados(resultados, chave: str) -> None:
+    """
+    Gráfico (ou cartão) e tabela de cada consulta, montados pelo código a partir
+    do resultado estruturado, com a procedência logo abaixo.
+    """
     agent = st.session_state.agent
-    for resultado in resultados:
-        st.dataframe(resultado.tabela_exibicao(), hide_index=True, width="stretch")
+    for i, resultado in enumerate(resultados):
+        tipo, visual = visualizacao(resultado, _modo_do_tema())
+        tabela = resultado.tabela_exibicao()
+        if tipo == "cartao":
+            st.metric(**visual)
+            if len(tabela.columns) > 1:
+                st.dataframe(tabela, hide_index=True, width="stretch")
+        elif tipo == "figura":
+            aba_grafico, aba_tabela = st.tabs(["Gráfico", "Tabela"])
+            with aba_grafico:
+                st.plotly_chart(visual, width="stretch", key=f"{chave}-{i}", config={"displayModeBar": False})
+            with aba_tabela:
+                st.dataframe(tabela, hide_index=True, width="stretch")
+        else:
+            st.dataframe(tabela, hide_index=True, width="stretch")
         st.caption(agent.procedencia(resultado))
 
 
 def render_chat_history() -> None:
-    for message in st.session_state.messages:
+    for n, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
-            render_resultados(message.get("resultados", []))
+            render_resultados(message.get("resultados", []), chave=f"msg{n}")
+
+
+def _escolher_sugestao(pergunta: str) -> None:
+    # Callback: roda antes da próxima execução do script, então a página já é
+    # montada sem os botões e com a pergunta pendente.
+    st.session_state.pergunta_pendente = pergunta
+
+
+def render_sugestoes() -> None:
+    """Perguntas de exemplo na conversa vazia."""
+    st.caption("Experimente perguntar:")
+    colunas = st.columns(2)
+    for i, pergunta in enumerate(PERGUNTAS_SUGERIDAS):
+        colunas[i % 2].button(
+            pergunta, key=f"sugestao{i}", width="stretch", on_click=_escolher_sugestao, args=(pergunta,)
+        )
 
 
 def process_user_message(user_input: str) -> None:
@@ -122,7 +169,7 @@ def process_user_message(user_input: str) -> None:
             logger.exception("Erro inesperado ao processar a mensagem do usuário.")
             turno = Turno(USER_FACING_ERROR)
             st.markdown(turno.texto)
-        render_resultados(turno.resultados)
+        render_resultados(turno.resultados, chave=f"msg{len(st.session_state.messages)}")
 
     st.session_state.messages.append(
         {"role": "assistant", "content": turno.texto, "resultados": turno.resultados}
@@ -153,7 +200,11 @@ def main() -> None:
     render_sidebar()
     render_chat_history()
 
-    user_input = st.chat_input("Ex: Quantas toneladas de soja foram exportadas em 2025?")
+    pendente = st.session_state.pop("pergunta_pendente", None)
+    if not st.session_state.messages and not pendente:
+        render_sugestoes()
+
+    user_input = st.chat_input("Ex: Quantas toneladas de soja foram exportadas em 2025?") or pendente
     if user_input:
         process_user_message(user_input)
 
