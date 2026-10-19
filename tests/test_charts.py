@@ -56,7 +56,17 @@ def test_yoy_por_terminal_vira_barras_em_dois_tons(store):
     tipo, fig = _vis(store, start_date="2024", end_date="2025", compare_with_previous=True, group_by=["terminal"])
     assert tipo == "figura"
     assert [trace.name for trace in fig.data] == ["2024", "2025"]
-    assert fig.data[0].marker.color != fig.data[1].marker.color
+    # Mesmo azul; o ano anterior recua por transparência, em qualquer tema.
+    assert fig.data[0].marker.color == fig.data[1].marker.color
+    assert fig.data[0].marker.opacity < fig.data[1].marker.opacity
+
+
+def test_grafico_nao_fixa_cores_do_tema(store):
+    # Fundo, textos e grade ficam com o tema do Streamlit, aplicado no navegador.
+    _, fig = _vis(store, metric="market_share", start_date="2025", end_date="2025", group_by=["terminal"])
+    assert fig.layout.paper_bgcolor is None and fig.layout.plot_bgcolor is None
+    assert fig.layout.font.color is None and fig.data[0].textfont.color is None
+    assert fig.layout.xaxis.gridcolor is None and fig.layout.yaxis.tickfont.color is None
 
 
 def test_cagr_sem_terminal_vira_cartao():

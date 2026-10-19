@@ -90,13 +90,6 @@ def render_sidebar() -> None:
     st.sidebar.write(f"**Busca em documentos:** {agent.knowledge_agent.status_message}")
 
 
-def _modo_do_tema() -> str:
-    try:
-        return st.context.theme.type or "light"
-    except Exception:
-        return "light"
-
-
 def render_resultados(resultados, chave: str) -> None:
     """
     Gráfico (ou cartão) e tabela de cada consulta, montados pelo código a partir
@@ -104,7 +97,7 @@ def render_resultados(resultados, chave: str) -> None:
     """
     agent = st.session_state.agent
     for i, resultado in enumerate(resultados):
-        tipo, visual = visualizacao(resultado, _modo_do_tema())
+        tipo, visual = visualizacao(resultado)
         tabela = resultado.tabela_exibicao()
         if tipo == "cartao":
             st.metric(**visual)
@@ -113,7 +106,10 @@ def render_resultados(resultados, chave: str) -> None:
         elif tipo == "figura":
             aba_grafico, aba_tabela = st.tabs(["Gráfico", "Tabela"])
             with aba_grafico:
-                st.plotly_chart(visual, width="stretch", key=f"{chave}-{i}", config={"displayModeBar": False})
+                # theme="streamlit": o navegador aplica o tema ativo (claro/escuro) ao gráfico.
+                st.plotly_chart(
+                    visual, theme="streamlit", width="stretch", key=f"{chave}-{i}", config={"displayModeBar": False}
+                )
             with aba_tabela:
                 st.dataframe(tabela, hide_index=True, width="stretch")
         else:
