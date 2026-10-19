@@ -180,6 +180,7 @@ class PortAgent:
     def __init__(self, request_timeout: float = 60.0, max_retries: int = 2):
         logger.info("Iniciando o agente...")
         self.model_name = os.getenv("PORT_AGENT_MODEL", "gpt-4o")
+        self._aceita_temperatura = True
         fato, self.data_coverage, self.data_diagnostics = load_port_data()
         self.store = PortDataStore(fato)
         self.knowledge_agent = KnowledgeAgent()
@@ -251,14 +252,26 @@ class PortAgent:
         kwargs = {
             "model": self.model_name,
             "messages": messages,
-            "temperature": 0.0,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        if self._aceita_temperatura:
+            kwargs["temperature"] = 0.0
         if usar_ferramentas:
             kwargs["tools"] = TOOLS
+        try:
+            stream = self.client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            # Alguns modelos (ex.: de raciocínio) só aceitam a temperatura padrão.
+            if "temperature" not in kwargs or "temperature" not in str(exc):
+                raise
+            logger.info("O modelo %s não aceita temperature; seguindo sem ela.", self.model_name)
+            self._aceita_temperatura = False
+            kwargs.pop("temperature")
+            stream = self.client.chat.completions.create(**kwargs)
+
         partes, chamadas = [], {}
-        for chunk in self.client.chat.completions.create(**kwargs):
+        for chunk in stream:
             if not chunk.choices:  # o último pedaço traz só o uso de tokens
                 continue
             delta = chunk.choices[0].delta
