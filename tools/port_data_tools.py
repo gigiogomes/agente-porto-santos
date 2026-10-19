@@ -1,4 +1,6 @@
+import logging
 import os
+import re
 import time
 import unicodedata
 from dataclasses import dataclass, asdict
@@ -11,8 +13,13 @@ import pandas as pd
 import numpy as np
 import requests
 
-URL_MENSARIO = "http://mensario.portodesantos.com.br/exportarcargas/csv"
+logger = logging.getLogger(__name__)
+
+URL_MENSARIO = "https://mensario.portodesantos.com.br/exportarcargas/csv"
 BACKUP_CSV_URL = "https://github.com/gigiogomes/agente-porto-santos/releases/download/v1.0/exportacao_cargas.csv"
+
+# Ordem de prioridade: o backup é uma cópia estática e só é baixado se a APS falhar.
+DATA_SOURCES = [("APS", URL_MENSARIO), ("BACKUP", BACKUP_CSV_URL)]
 
 TERMINAL_MAPPING = {
     "SBSA": "Santos Brasil",
@@ -39,8 +46,13 @@ TERMINAL_ALIASES = {
     "TERMARES": ["TERMARES"],
     "TRANSBRASA": ["TRANSBRASA"],
     "LOCALFRIO": ["LOCALFRIO"],
-    "BANDEIRANTES-DEICMAR": ["BANDEIRANTES-DEICMAR", "DEICMAR"],
+    "BANDEIRANTES-DEICMAR": ["BANDEIRANTES-DEICMAR", "DEICMAR", "BANDEIRANTES"],
 }
+
+# Terminais sem alias (LIBRA 35, RODRIMAR, Outros...) mantêm o nome normalizado
+# como sigla. Nunca podem virar nulos: o groupby descartaria as linhas e o
+# market share seria calculado sobre um total menor que o real.
+TERMINAL_NAO_INFORMADO = "N/D"
 
 @dataclass
 class DataCoverage:
@@ -52,6 +64,7 @@ class DataCoverage:
     row_count: int
     loaded_at: str
     cargo_mix_list: list
+    terminal_list: list
 
 def _normalize_text(value: str) -> str:
     if pd.isna(value) or value is None:
@@ -81,12 +94,43 @@ def _canonical_terminal_sigla_from_norm(value_norm: str) -> Optional[str]:
             return sigla
     return None
 
+def _canonical_terminal(value: str) -> str:
+    """Sigla oficial quando há alias; senão o nome normalizado (ex.: 'LIBRA 35')."""
+    value_norm = _normalize_text(value)
+    if not value_norm:
+        return TERMINAL_NAO_INFORMADO
+    return _canonical_terminal_sigla_from_norm(value_norm) or value_norm
+
+def _parse_month_bound(value: str, is_end: bool) -> pd.Timestamp:
+    """
+    Converte 'YYYY', 'YYYY-MM' ou 'YYYY-MM-DD' no primeiro dia do mês. A base é
+    mensal (DATE é sempre dia 01), então o dia é ignorado — isso aceita datas
+    como '2026-06-31', que o LLM gera com frequência para "fim do mês".
+    """
+    match = re.match(r"^\s*(\d{4})(?:-(\d{1,2})(?:-\d{1,2})?)?\s*$", str(value))
+    if not match:
+        raise ValueError(f"Data inválida: '{value}'. Use YYYY, YYYY-MM ou YYYY-MM-DD.")
+    year = int(match.group(1))
+    month = int(match.group(2)) if match.group(2) else (12 if is_end else 1)
+    if not 1 <= month <= 12:
+        raise ValueError(f"Mês inválido em '{value}'.")
+    return pd.Timestamp(year=year, month=month, day=1)
+
+def _filter_period(df: pd.DataFrame, start_date: Optional[str], end_date: Optional[str]) -> pd.DataFrame:
+    if start_date:
+        df = df[df["DATE"] >= _parse_month_bound(start_date, is_end=False)]
+    if end_date:
+        df = df[df["DATE"] <= _parse_month_bound(end_date, is_end=True)]
+    return df
+
 def _normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["ANO"] = pd.to_numeric(df["ANO"], errors="coerce").fillna(0).astype(int)
     df["MES"] = pd.to_numeric(df["MES"], errors="coerce").fillna(0).astype(int)
     df["TERMINAIS_NORM"] = df["TERMINAIS"].apply(_normalize_text)
-    df["TERMINAL_SIGLA_CANONICA"] = df["TERMINAIS_NORM"].apply(_canonical_terminal_sigla_from_norm)
+    # Mapeia por valor único (poucas dezenas de terminais) em vez de linha a linha.
+    terminal_map = {v: _canonical_terminal(v) for v in df["TERMINAIS_NORM"].unique()}
+    df["TERMINAL_SIGLA_CANONICA"] = df["TERMINAIS_NORM"].map(terminal_map)
 
     for col in ["TOTAL_TEU", "TOTAL_UNID"]:
         if col in df.columns:
@@ -148,6 +192,12 @@ def _extract_coverage(df: pd.DataFrame, source_name: str) -> DataCoverage:
     meses_max = df.loc[df["ANO"] == anos.max(), "MES"] if not anos.empty else pd.Series(dtype=int)
 
     cm_list = df["ESTADO"].dropna().unique().tolist() if "ESTADO" in df.columns else []
+    # Ordenada por volume, para o prompt listar primeiro os terminais relevantes.
+    terminal_list = (
+        df.groupby("TERMINAL_SIGLA_CANONICA")["TOTAL_TEU"].sum().sort_values(ascending=False).index.tolist()
+        if "TOTAL_TEU" in df.columns
+        else sorted(df["TERMINAL_SIGLA_CANONICA"].unique().tolist())
+    )
 
     return DataCoverage(
         source_name=source_name,
@@ -158,13 +208,12 @@ def _extract_coverage(df: pd.DataFrame, source_name: str) -> DataCoverage:
         row_count=len(df),
         loaded_at=datetime.now().isoformat(timespec="seconds"),
         cargo_mix_list=cm_list,
+        terminal_list=terminal_list,
     )
 
-@st.cache_data(show_spinner=False)
-def load_port_data():
+def _load_port_data_uncached():
     diagnostics = []
-    candidates = []
-    for source_name, url in [("APS", URL_MENSARIO), ("BACKUP", BACKUP_CSV_URL)]:
+    for source_name, url in DATA_SOURCES:
         try:
             raw_df = _read_csv_from_url(url)
 
@@ -174,18 +223,21 @@ def load_port_data():
             df = _normalize_dataframe(raw_df)
             coverage = _extract_coverage(df, source_name)
             diagnostics.append({"source": source_name, "status": "success"})
-            candidates.append((df, coverage))
+            if source_name != DATA_SOURCES[0][0]:
+                logger.warning("Fonte principal indisponível; usando %s (pode estar desatualizada).", source_name)
+            return df, coverage, diagnostics
         except Exception as exc:
+            logger.warning("Falha ao carregar a fonte %s: %s", source_name, exc)
             diagnostics.append({"source": source_name, "status": "error", "error": str(exc)})
 
-    if not candidates:
-        error_details = "\n".join(
-            [f"- {d['source']}: {d.get('error', 'Erro desconhecido')}" for d in diagnostics if d["status"] == "error"]
-        )
-        raise RuntimeError(f"Falha fatal ao carregar dados. Detalhes dos erros:\n{error_details}")
+    error_details = "\n".join(
+        [f"- {d['source']}: {d.get('error', 'Erro desconhecido')}" for d in diagnostics if d["status"] == "error"]
+    )
+    raise RuntimeError(f"Falha fatal ao carregar dados. Detalhes dos erros:\n{error_details}")
 
-    selected_df, selected_coverage = max(candidates, key=lambda c: (c[1].max_year, c[1].max_month))
-    return selected_df, selected_coverage, diagnostics
+@st.cache_data(show_spinner=False)
+def load_port_data():
+    return _load_port_data_uncached()
 
 
 # =================================================================
@@ -218,11 +270,7 @@ def _compute_cagr(
     val_col = "TOTAL_TEU"
 
     # Completude avaliada port-wide na janela pedida.
-    scope = df_full
-    if start_date:
-        scope = scope[scope["DATE"] >= pd.to_datetime(start_date)]
-    if end_date:
-        scope = scope[scope["DATE"] <= pd.to_datetime(end_date)]
+    scope = _filter_period(df_full, start_date, end_date)
 
     complete_years = _detect_complete_years(scope)
     if len(complete_years) < 2:
@@ -362,14 +410,13 @@ def query_port_data(
     df_filtered = df.copy()
 
     # 1. Filtros de Período
-    if start_date:
-        df_filtered = df_filtered[df_filtered["DATE"] >= pd.to_datetime(start_date)]
-    if end_date:
-        df_filtered = df_filtered[df_filtered["DATE"] <= pd.to_datetime(end_date)]
+    df_filtered = _filter_period(df_filtered, start_date, end_date)
 
     # 2. Filtros de Terminal e Cargo Mix
     if terminals and len(terminals) > 0:
-        df_filtered = df_filtered[df_filtered["TERMINAL_SIGLA_CANONICA"].isin(terminals)]
+        # Aceita sigla ou nome por extenso ("Santos Brasil" -> "SBSA").
+        siglas = [_canonical_terminal(t) for t in terminals]
+        df_filtered = df_filtered[df_filtered["TERMINAL_SIGLA_CANONICA"].isin(siglas)]
 
     if cargo_mix_filter and len(cargo_mix_filter) > 0:
         filtros_norm = [_normalize_text(c) for c in cargo_mix_filter]
@@ -427,7 +474,8 @@ def query_port_data(
         total_geral = aggregated[val_col].sum()
         if total_geral > 0:
             aggregated["Share (%)"] = ((aggregated[val_col] / total_geral) * 100).round(2)
-            aggregated = aggregated.sort_values(by="Share (%)", ascending=False)
+            # Ordena pelo volume exato: o share arredondado empata itens pequenos (0.0%).
+            aggregated = aggregated.sort_values(by=val_col, ascending=False)
             aggregated["Share (%)"] = aggregated["Share (%)"].astype(str) + "%"
 
     if val_col in aggregated.columns:
