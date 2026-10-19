@@ -50,3 +50,6 @@ Thumbs.db
 *.csv
 # Tabelas de referência versionadas (exceção ao *.csv acima)
 !reference/*.csv
+
+# Resultados das avaliações (gerados localmente)
+evals/results/
