@@ -213,12 +213,15 @@ def _parse_month_bound(value: str, is_end: bool) -> pd.Timestamp:
 
 
 def _resolve_mercadorias(store: PortDataStore, filtros: List[str]) -> List[str]:
-    """Nome exato quando existe; senão todas as mercadorias que contêm o termo ('SOJA')."""
+    """
+    Todas as mercadorias que contêm o termo. 'FERTILIZANTES' traz a família
+    inteira (fosfatados, potássicos...), e não só a categoria genérica de mesmo
+    nome; 'SOJA EM GRAOS' continua trazendo só os grãos.
+    """
     resolved = []
     for filtro in filtros:
         termo = normalize_text(filtro)
-        matches = [termo] if termo in store.mercadorias else [m for m in store.mercadorias if termo and termo in m]
-        resolved.extend(m for m in matches if m not in resolved)
+        resolved.extend(m for m in store.mercadorias if termo and termo in m and m not in resolved)
     return resolved
 
 
@@ -316,6 +319,100 @@ def _reduce(store: PortDataStore, clauses: List[str], params: list, extra_dims: 
 
 
 # =================================================================
+# RESULTADO ESTRUTURADO
+# =================================================================
+# Nomes amigáveis das colunas no formato de exibição (pt-BR).
+COLUNAS_EXIBICAO = {
+    "ANO": "Ano",
+    "ANO_MES": "Mês",
+    "ANO_BIMESTRE": "Bimestre",
+    "ANO_TRIMESTRE": "Trimestre",
+    "ANO_QUADRIMESTRE": "Quadrimestre",
+    "ANO_SEMESTRE": "Semestre",
+    "TERMINAL_SIGLA_CANONICA": "Terminal",
+    "ESTADO": "Cargo mix",
+    "NATUREZA_CARGA": "Natureza",
+    "MERCADORIA": "Mercadoria",
+    "SENTIDO": "Sentido",
+    "TIPO_NAVEGACAO": "Navegação",
+    "TOTAL_TEU": "TEU",
+    "TOTAL_UNID": "Unidades",
+    "TOTAL_TON": "Toneladas",
+}
+
+
+def _is_missing(value) -> bool:
+    return value is None or (isinstance(value, float) and pd.isna(value))
+
+
+def formatar_numero(value) -> str:
+    """1234567.4 -> '1.234.567'."""
+    return "N/D" if _is_missing(value) else f"{int(round(value)):,}".replace(",", ".")
+
+
+def formatar_percentual(value) -> str:
+    """43.9123 -> '43,91%'."""
+    return "N/D" if _is_missing(value) else f"{value:.2f}%".replace(".", ",")
+
+
+@dataclass
+class QueryResult:
+    """
+    Resultado de uma consulta: a tabela com valores numéricos e o contexto
+    necessário para exibi-la (notas, medida, filtros). O texto para o LLM e a
+    tabela da interface são gerados a partir daqui, pelo código.
+    """
+
+    tipo: str  # "aviso" | "total" | "tabela" | "share" | "yoy" | "cagr"
+    medida: str  # rótulo: TEU, Unidades ou Toneladas
+    filtros: dict
+    notas: List[str] = field(default_factory=list)
+    tabela: Optional[pd.DataFrame] = None
+    colunas_dim: List[str] = field(default_factory=list)
+    colunas_valor: List[str] = field(default_factory=list)
+    colunas_pct: List[str] = field(default_factory=list)
+    textos_na: dict = field(default_factory=dict)
+
+    def tabela_exibicao(self) -> Optional[pd.DataFrame]:
+        """Tabela formatada em pt-BR, com nomes de coluna amigáveis."""
+        if self.tabela is None:
+            return None
+        tabela = self.tabela.copy()
+        for col in self.colunas_valor:
+            tabela[col] = tabela[col].map(formatar_numero)
+        for col in self.colunas_pct:
+            na = self.textos_na.get(col, "N/D")
+            tabela[col] = tabela[col].map(lambda v, na=na: na if _is_missing(v) else formatar_percentual(v))
+        return tabela.rename(columns=COLUNAS_EXIBICAO)
+
+    def texto(self, formato: str = "en") -> str:
+        """
+        'pt': números no padrão brasileiro, para o LLM repetir sem converter.
+        'en': formato histórico da ferramenta (mantido para compatibilidade).
+        """
+        notas = "".join(self.notas)
+        if self.tabela is None:
+            return notas
+        if formato == "pt":
+            return notas + self.tabela_exibicao().to_string(index=False)
+        tabela = self.tabela.copy()
+        for col in self.colunas_pct:
+            na = self.textos_na.get(col, "N/D")
+            tabela[col] = tabela[col].map(lambda v, na=na: na if _is_missing(v) else f"{v}%")
+        return notas + tabela.to_string(index=False)
+
+
+def _aviso(mensagem: str, medida: str, filtros: dict, notas: Optional[List[str]] = None) -> QueryResult:
+    return QueryResult("aviso", medida, filtros, notas=[*(notas or []), mensagem])
+
+
+def _descrever_meses(meses: List[int]) -> str:
+    if meses == list(range(meses[0], meses[-1] + 1)):
+        return f"{meses[0]} a {meses[-1]}" if len(meses) > 1 else f"{meses[0]}"
+    return ", ".join(str(m) for m in meses)
+
+
+# =================================================================
 # CAGR DETERMINÍSTICO (calculado no código, nunca pelo LLM)
 # =================================================================
 def _detect_complete_years(store: PortDataStore, scope: List[str], scope_params: list) -> set:
@@ -330,17 +427,20 @@ def _detect_complete_years(store: PortDataStore, scope: List[str], scope_params:
     return {int(row.ano) for row in months.itertuples() if row.n >= 12}
 
 
-def _compute_cagr(complete_years: set, df_filtered: pd.DataFrame, group_by, val_col: str, label: str) -> str:
+def _compute_cagr(
+    complete_years: set, df_filtered: pd.DataFrame, group_by, val_col: str, label: str, base: QueryResult
+) -> QueryResult:
     """
     CAGR = (valor_final / valor_inicial) ** (1 / anos) - 1, usando os endpoints
     de ANOS COMPLETOS dentro da janela. Retorna tabela transparente com os anos
     e volumes efetivamente usados, para o bot repassar sem inventar.
     """
     if len(complete_years) < 2:
-        return (
+        return _aviso(
             "[AVISO DO SISTEMA] Não há anos completos suficientes (>= 2) para calcular o CAGR "
             f"na janela informada. Anos completos detectados: {sorted(complete_years) or 'nenhum'}. "
-            "O bot deve informar isso ao usuário e NÃO deve estimar o valor por conta própria."
+            "O bot deve informar isso ao usuário e NÃO deve estimar o valor por conta própria.",
+            base.medida, base.filtros, base.notas,
         )
 
     first_year = min(complete_years)
@@ -373,44 +473,56 @@ def _compute_cagr(complete_years: set, df_filtered: pd.DataFrame, group_by, val_
         row["Anos"] = n
 
         if v0 is None or vn is None or v0 <= 0:
-            row["CAGR (%)"] = "N/D (sem movimentação no ano inicial)"
+            row["CAGR (%)"] = float("nan")
         else:
-            cagr = (vn / v0) ** (1.0 / n) - 1.0
-            row["CAGR (%)"] = f"{round(cagr * 100, 2)}%"
+            row["CAGR (%)"] = round(((vn / v0) ** (1.0 / n) - 1.0) * 100, 2)
         rows.append(row)
 
-    result = pd.DataFrame(rows)
     note = (
         f"[CAGR calculado deterministicamente sobre anos completos: {first_year} a {last_year} "
         f"({n} ano{'s' if n != 1 else ''} de variação). Os endpoints definem o CAGR; "
         f"anos intermediários não alteram o cálculo.]\n"
     )
-    return note + result.to_string(index=False)
+    return QueryResult(
+        "cagr", base.medida, base.filtros,
+        notas=[*base.notas, note],
+        tabela=pd.DataFrame(rows),
+        colunas_dim=["Terminal"] if by_terminal else [],
+        colunas_valor=[f"{label} Inicial", f"{label} Final"],
+        colunas_pct=["CAGR (%)"],
+        textos_na={"CAGR (%)": "N/D (sem movimentação no ano inicial)"},
+    )
 
 
-def _compute_yoy(df_filtered: pd.DataFrame, group_by, val_col: str, label: str) -> str:
+def _compute_yoy(df_filtered: pd.DataFrame, group_by, val_col: str, label: str, base: QueryResult) -> QueryResult:
     """
     YoY determinístico. Sempre separa os anos em COLUNAS (ano_anterior /
     ano_atual / Diferença / YoY %), independentemente de o modelo ter incluído
-    'ano' no group_by. Se o ano atual for parcial, faz a comparação acumulada
-    (YTD) e DIZ isso explicitamente, em vez de rotular silenciosamente um valor
-    parcial como se fosse o ano cheio.
+    'ano' no group_by. Compara só os meses presentes nos DOIS anos: ano cheio,
+    acumulado do ano (YTD) e mês contra mês saem da mesma regra, e a nota diz
+    exatamente qual foi a base da comparação.
     """
     years = sorted(int(y) for y in df_filtered["ANO"].unique())
     if len(years) < 2:
-        return (
+        return _aviso(
             f"[AVISO DO SISTEMA] YoY precisa de dois anos na janela, mas só há: {years}. "
-            "O bot deve pedir um período que inclua o ano anterior e NÃO deve inventar valores."
+            "O bot deve pedir um período que inclua o ano anterior e NÃO deve inventar valores.",
+            base.medida, base.filtros, base.notas,
         )
     curr, prev = years[-1], years[-2]
 
-    curr_max_month = int(df_filtered[df_filtered["ANO"] == curr]["MES"].max())
-    full_year = curr_max_month >= 12
+    months_curr = set(df_filtered.loc[df_filtered["ANO"] == curr, "MES"])
+    months_prev = set(df_filtered.loc[df_filtered["ANO"] == prev, "MES"])
+    common = sorted(int(m) for m in months_curr & months_prev)
+    if not common:
+        return _aviso(
+            f"[AVISO DO SISTEMA] {prev} e {curr} não têm meses em comum na janela informada; "
+            "não há base para comparação. O bot deve pedir um período que cubra os mesmos meses nos dois anos.",
+            base.medida, base.filtros, base.notas,
+        )
 
-    # Comparação justa: limita ambos os anos aos meses disponíveis no ano atual.
-    dft = df_filtered[
-        (df_filtered["ANO"].isin([prev, curr])) & (df_filtered["MES"] <= curr_max_month)
-    ]
+    # Comparação justa: os dois anos limitados aos mesmos meses.
+    dft = df_filtered[(df_filtered["ANO"].isin([prev, curr])) & (df_filtered["MES"].isin(common))]
 
     gb = [group_by] if isinstance(group_by, str) else (group_by or [])
     # group_by temporais (ano/mes/...) são ignorados: o YoY já é por ano.
@@ -431,30 +543,56 @@ def _compute_yoy(df_filtered: pd.DataFrame, group_by, val_col: str, label: str) 
 
     pivot["Diferença"] = (pivot[curr] - pivot[prev]).round(0).astype(int)
     pivot["YoY (%)"] = pivot.apply(
-        lambda r: f"{round((r[curr] / r[prev] - 1) * 100, 2)}%"
-        if r[prev] > 0
-        else "N/D (sem base no ano anterior)",
+        lambda r: round((r[curr] / r[prev] - 1) * 100, 2) if r[prev] > 0 else float("nan"),
         axis=1,
     )
     pivot[prev] = pivot[prev].round(0).astype(int)
     pivot[curr] = pivot[curr].round(0).astype(int)
     pivot = pivot.rename(columns={prev: f"{label} {prev}", curr: f"{label} {curr}"})
+    pivot.columns.name = None
 
     if dim_cols:
         pivot = pivot.sort_values(by=f"{label} {curr}", ascending=False)
 
-    if full_year:
+    if len(common) == 12:
         note = f"[YoY ano cheio: {prev} vs {curr}.]\n"
-    else:
+    elif common == list(range(1, common[-1] + 1)):
         note = (
-            f"[YoY ACUMULADO/YTD: meses 1 a {curr_max_month}. O ano {curr} só tem dados até o mês "
-            f"{curr_max_month}, então {prev} também foi limitado aos meses 1 a {curr_max_month} para "
+            f"[YoY ACUMULADO/YTD: meses 1 a {common[-1]}. O ano {curr} só tem dados até o mês "
+            f"{common[-1]}, então {prev} também foi limitado aos meses 1 a {common[-1]} para "
             f"comparação justa. ATENÇÃO: estes NÃO são valores de ano cheio — informe isso ao usuário.]\n"
         )
-    return note + pivot.to_string(index=False)
+    else:
+        note = (
+            f"[YoY dos mesmos meses nos dois anos: mês(es) {_descrever_meses(common)} de {prev} vs {curr}. "
+            f"ATENÇÃO: não são valores de ano cheio — informe ao usuário exatamente o período comparado.]\n"
+        )
+    return QueryResult(
+        "yoy", base.medida, base.filtros,
+        notas=[*base.notas, note],
+        tabela=pivot,
+        colunas_dim=dim_cols,
+        colunas_valor=[f"{label} {prev}", f"{label} {curr}", "Diferença"],
+        colunas_pct=["YoY (%)"],
+        textos_na={"YoY (%)": "N/D (sem base no ano anterior)"},
+    )
 
 
-def query_port_data(
+def _descrever_periodo(start_date, end_date) -> str:
+    def fmt(value, is_end):
+        bound = _parse_month_bound(value, is_end)
+        return f"{bound.month:02d}/{bound.year}"
+
+    if start_date and end_date:
+        return f"{fmt(start_date, False)} a {fmt(end_date, True)}"
+    if start_date:
+        return f"a partir de {fmt(start_date, False)}"
+    if end_date:
+        return f"até {fmt(end_date, True)}"
+    return "todo o período disponível"
+
+
+def run_query(
     store: PortDataStore,
     metric: str = "teus",
     start_date: str = None,
@@ -468,7 +606,7 @@ def query_port_data(
     mercadorias: list = None,
     sentido: list = None,
     navegacao: list = None,
-) -> str:
+) -> QueryResult:
     """Motor universal de agregação."""
     # 1. Medida e escopo. TEU e unidades de contêiner só fazem sentido para carga
     # conteinerizada (carga geral também conta "unidades", ex.: veículos); em
@@ -479,14 +617,26 @@ def query_port_data(
     val_col, label = MEDIDAS[medida]
     naturezas = natureza_carga or ([NATUREZA_CONTEINER] if medida in ("teu", "unidades") else None)
 
+    filtros = {
+        "periodo": _descrever_periodo(start_date, end_date),
+        "terminais": [canonical_terminal(t) for t in terminals or []],
+        "naturezas": [normalize_text(n) for n in naturezas] if naturezas else ["todas"],
+        "mercadorias": [],
+        "sentido": [normalize_text(s) for s in sentido or []],
+        "navegacao": [normalize_text(n) for n in navegacao or []],
+        "cargo_mix": [normalize_text(c) for c in cargo_mix_filter or []],
+    }
+
     mercadorias_resolvidas = None
     if mercadorias:
         mercadorias_resolvidas = _resolve_mercadorias(store, mercadorias)
         if not mercadorias_resolvidas:
-            return (
+            return _aviso(
                 f"[AVISO DO SISTEMA] Mercadoria não encontrada: {mercadorias}. "
-                f"Valores válidos: {', '.join(store.mercadorias)}. O bot deve informar isso ao usuário."
+                f"Valores válidos: {', '.join(store.mercadorias)}. O bot deve informar isso ao usuário.",
+                label, filtros,
             )
+        filtros["mercadorias"] = mercadorias_resolvidas
 
     # Filtros fora do padrão histórico (só contêiner, em TEU/unidades) são
     # descritos no resultado, para o bot saber exatamente o que foi somado.
@@ -499,7 +649,7 @@ def query_port_data(
         escopo.append(f"sentido={', '.join(sentido)}")
     if navegacao:
         escopo.append(f"navegacao={', '.join(navegacao)}")
-    nota_escopo = f"[Escopo: medida={label}; {'; '.join(escopo)}]\n" if escopo else ""
+    base = QueryResult("tabela", label, filtros, notas=[f"[Escopo: medida={label}; {'; '.join(escopo)}]\n"] if escopo else [])
 
     # 2. Filtragem e soma no DuckDB
     gb = [group_by] if isinstance(group_by, str) else (group_by or [])
@@ -511,20 +661,21 @@ def query_port_data(
 
     if df_filtered.empty:
         extras = f" Escopo: {'; '.join(escopo)}." if escopo else ""
-        return (
+        return _aviso(
             f"[AVISO DO SISTEMA] Nenhum dado encontrado. Filtros usados: Terminais={terminals}, "
-            f"CargoMix={cargo_mix_filter}, Periodo={start_date} a {end_date}.{extras} O bot deve informar isso ao usuário."
+            f"CargoMix={cargo_mix_filter}, Periodo={start_date} a {end_date}.{extras} O bot deve informar isso ao usuário.",
+            label, filtros,
         )
 
     # 2.5 CAGR é determinístico: calcula no código e retorna (não cai no fluxo de soma).
     if metric == "cagr":
         complete_years = _detect_complete_years(store, scope, scope_params)
-        return nota_escopo + _compute_cagr(complete_years, df_filtered, gb, val_col, label)
+        return _compute_cagr(complete_years, df_filtered, gb, val_col, label, base)
 
     # 3.5 YoY é determinístico: pivota por ano em colunas e rotula a base
-    # (acumulado/YTD vs ano cheio). Retorna sem cair no fluxo genérico de soma.
+    # (ano cheio, acumulado ou mesmos meses). Retorna sem cair no fluxo genérico de soma.
     if compare_with_previous:
-        return nota_escopo + _compute_yoy(df_filtered, gb, val_col, label)
+        return _compute_yoy(df_filtered, gb, val_col, label, base)
 
     # 4. Agrupamento Múltiplo (Tabela Dinâmica)
     groupby_cols = [GROUP_BY_COLUMNS[g] for g in gb if g in GROUP_BY_COLUMNS]
@@ -536,15 +687,29 @@ def query_port_data(
         val_col = "Total"
 
     # 5. Cálculo de Share / Proporção Percentual
+    colunas_pct = []
     if metric == "market_share":
         total_geral = aggregated[val_col].sum()
         if total_geral > 0:
             aggregated["Share (%)"] = ((aggregated[val_col] / total_geral) * 100).round(2)
             # Ordena pelo volume exato: o share arredondado empata itens pequenos (0.0%).
             aggregated = aggregated.sort_values(by=val_col, ascending=False)
-            aggregated["Share (%)"] = aggregated["Share (%)"].astype(str) + "%"
+            colunas_pct = ["Share (%)"]
 
     if val_col in aggregated.columns:
         aggregated[val_col] = aggregated[val_col].round(0).astype(int)
 
-    return nota_escopo + aggregated.to_string(index=False)
+    tipo = "share" if colunas_pct else ("tabela" if groupby_cols else "total")
+    return QueryResult(
+        tipo, label, filtros,
+        notas=base.notas,
+        tabela=aggregated,
+        colunas_dim=groupby_cols,
+        colunas_valor=[val_col],
+        colunas_pct=colunas_pct,
+    )
+
+
+def query_port_data(store: PortDataStore, **kwargs) -> str:
+    """Versão em texto de `run_query`, no formato histórico da ferramenta."""
+    return run_query(store, **kwargs).texto()

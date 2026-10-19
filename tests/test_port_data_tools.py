@@ -108,12 +108,21 @@ def test_toneladas_considera_o_porto_inteiro_e_descreve_o_escopo(store_misto):
     assert out.startswith("[Escopo: medida=Toneladas; naturezas=todas]")
 
 
-def test_mercadoria_nome_exato_ou_parcial(store_misto):
-    exato = pdt.query_port_data(store_misto, metric="toneladas", mercadorias=["Soja em grãos"])
-    parcial = pdt.query_port_data(store_misto, metric="toneladas", mercadorias=["soja"])
-    assert exato.split()[-1] == "5000"
-    assert parcial.split()[-1] == "7000"
-    assert "FARELO DE SOJA" in parcial
+def test_mercadoria_por_trecho_do_nome(store_misto):
+    graos = pdt.query_port_data(store_misto, metric="toneladas", mercadorias=["Soja em grãos"])
+    soja = pdt.query_port_data(store_misto, metric="toneladas", mercadorias=["soja"])
+    assert graos.split()[-1] == "5000"
+    assert soja.split()[-1] == "7000"
+    assert "FARELO DE SOJA" in soja
+
+
+def test_mercadoria_generica_traz_a_familia_inteira():
+    rows = [
+        {"ano": 2025, "mes": 1, "terminal": "TIPLAM", "natureza": "GRANEL SOLIDO", "mercadoria": m, "ton": t}
+        for m, t in [("FERTILIZANTES", "10"), ("FERTILIZANTES POTÁSSICOS", "100"), ("FERTILIZANTES FOSFATADOS", "1.000")]
+    ]
+    out = pdt.query_port_data(make_store(rows), metric="toneladas", mercadorias=["fertilizantes"])
+    assert out.split()[-1] == "1110"
 
 
 def test_mercadoria_inexistente_lista_as_validas(store_misto):
@@ -150,6 +159,65 @@ def test_yoy_em_toneladas_rotula_a_medida():
     out = pdt.query_port_data(make_store(rows), metric="toneladas", compare_with_previous=True, group_by=["natureza_carga"])
     assert "Toneladas 2024" in out and "Toneladas 2025" in out
     assert "50.0%" in out
+
+
+# ------------------------------------------------------------------ #
+# YoY compara só os meses presentes nos dois anos
+# ------------------------------------------------------------------ #
+@pytest.fixture
+def store_mensal():
+    rows = [{"ano": 2025, "mes": m, "terminal": "BTP", "teu": 100} for m in range(1, 13)]
+    rows += [{"ano": 2026, "mes": m, "terminal": "BTP", "teu": 110 if m == 7 else 105} for m in range(1, 8)]
+    return make_store(rows)
+
+
+def test_yoy_mes_contra_mes(store_mensal):
+    # Janela jul/2025 a jul/2026: só julho existe nos dois anos.
+    out = pdt.query_port_data(store_mensal, start_date="2025-07", end_date="2026-07", compare_with_previous=True)
+    assert "mês(es) 7" in out
+    assert "10.0%" in out  # 100 -> 110, e não 100 -> soma de jan a jul de 2026
+
+
+def test_yoy_acumulado_do_ano(store_mensal):
+    out = pdt.query_port_data(store_mensal, start_date="2025", end_date="2026", compare_with_previous=True)
+    assert out.startswith("[YoY ACUMULADO/YTD: meses 1 a 7.")
+    assert "700" in out and "740" in out
+
+
+def test_yoy_sem_meses_em_comum():
+    rows = [{"ano": 2025, "mes": 12, "terminal": "BTP", "teu": 1}, {"ano": 2026, "mes": 1, "terminal": "BTP", "teu": 1}]
+    out = pdt.query_port_data(make_store(rows), compare_with_previous=True)
+    assert "não têm meses em comum" in out
+
+
+# ------------------------------------------------------------------ #
+# Resultado estruturado: formato brasileiro e procedência
+# ------------------------------------------------------------------ #
+def test_resultado_estruturado_e_formato_brasileiro():
+    rows = [{"ano": 2025, "mes": 1, "terminal": "SANTOS BRASIL", "teu": 2_595_312}, {"ano": 2025, "mes": 1, "terminal": "BTP", "teu": 1_977_127}]
+    result = pdt.run_query(make_store(rows), metric="market_share", start_date="2025-01-01", end_date="2025-12-31", group_by=["terminal"])
+
+    assert result.tipo == "share"
+    assert result.tabela["Share (%)"].tolist() == [56.76, 43.24]  # numérico, não texto
+    texto = result.texto("pt")
+    assert "2.595.312" in texto and "56,76%" in texto
+    assert "Terminal" in texto and "TERMINAL_SIGLA_CANONICA" not in texto
+    assert result.filtros["periodo"] == "01/2025 a 12/2025"
+    assert result.filtros["naturezas"] == ["CARGA CONTEINERIZADA"]
+
+
+def test_ano_nao_ganha_separador_de_milhar():
+    result = pdt.run_query(make_store([{"ano": 2025, "mes": 1, "terminal": "BTP", "teu": 1500}]), group_by=["ano"])
+    texto = result.texto("pt")
+    assert "2025" in texto and "2.025" not in texto
+    assert "1.500" in texto
+
+
+def test_aviso_e_resultado_sem_tabela(store):
+    result = pdt.run_query(store, terminals=["XYZ"])
+    assert result.tipo == "aviso"
+    assert result.tabela is None
+    assert "Nenhum dado encontrado" in result.texto("pt")
 
 
 def test_medida_invalida():
