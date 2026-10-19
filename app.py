@@ -145,15 +145,17 @@ def main() -> None:
     st.markdown(
         """
         Bem-vindo! Sou um agente especialista na movimentação de cargas do porto.
-        Você pode me perguntar sobre **market share, crescimento, mix de cargas, volumes (TEUs)**
-        e também sobre temas qualitativos, caso o knowledge agent esteja disponível.
+        Você pode me perguntar sobre **contêineres (TEUs), granéis sólidos e líquidos, carga geral
+        e mercadorias (em toneladas)**: market share, crescimento, CAGR, mix de cargas, exportação
+        e importação, por terminal e por período desde 2005.
+        Também respondo sobre temas qualitativos, caso o knowledge agent esteja disponível.
         """
     )
 
     render_sidebar()
     render_chat_history()
 
-    user_input = st.chat_input("Ex: Qual o market share por terminal em 2025?")
+    user_input = st.chat_input("Ex: Quantas toneladas de soja foram exportadas em 2025?")
     if user_input:
         process_user_message(user_input)
 

@@ -1,0 +1,54 @@
+name: Ingestão de dados
+
+on:
+  schedule:
+    - cron: "0 9 * * *" # todo dia às 06:00 (horário de Brasília)
+  workflow_dispatch:
+  push:
+    paths:
+      - "ingest/**"
+      - "reference/**"
+      - ".github/workflows/ingest.yml"
+
+permissions:
+  contents: write
+
+# Nunca duas ingestões ao mesmo tempo publicando na mesma release.
+concurrency:
+  group: ingest
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: ingest/requirements.txt
+
+      - run: pip install -r ingest/requirements.txt
+
+      - name: Rodar pipeline (baixa, valida e gera os arquivos)
+        id: pipeline
+        run: python -m ingest.pipeline --out build
+
+      - name: Publicar na release "dados"
+        if: steps.pipeline.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view dados >/dev/null 2>&1 || gh release create dados \
+            --title "Dados publicados" \
+            --notes "Arquivos gerados automaticamente pelo workflow de ingestão." \
+            --latest=false
+          # O manifesto vai por último: ele só aponta para a versão nova
+          # depois que os arquivos de dados já estão no lugar.
+          gh release upload dados \
+            build/fato_movimentacao.parquet build/dim_terminal.parquet build/bruto.parquet \
+            --clobber
+          gh release upload dados build/manifest.json --clobber
