@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Optional
@@ -8,10 +9,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 
 class KnowledgeAgent:
     def __init__(self, docs_dir: str = "docs", persist_dir: str = "chroma_db"):
-        print("Iniciando Agente de Conhecimento (RAG)...")
+        logger.info("Iniciando Agente de Conhecimento (RAG)...")
 
         self.docs_dir = docs_dir
         self.persist_dir = persist_dir
@@ -30,7 +33,7 @@ class KnowledgeAgent:
         try:
             from langchain_classic.chains import create_retrieval_chain
             from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-            from langchain_community.document_loaders import DirectoryLoader
+            from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader, TextLoader
             
             # --- NOVA IMPORTAÇÃO DO CHROMA COM FALLBACK ---
             try:
@@ -47,6 +50,8 @@ class KnowledgeAgent:
             return
 
         self._DirectoryLoader = DirectoryLoader
+        self._TextLoader = TextLoader
+        self._PyPDFLoader = PyPDFLoader
         self._Chroma = Chroma
         self._ChatPromptTemplate = ChatPromptTemplate
         self._RecursiveCharacterTextSplitter = RecursiveCharacterTextSplitter
@@ -131,10 +136,20 @@ class KnowledgeAgent:
         )
 
         if should_rebuild:
-            print("⚙️ Reindexando documentos do knowledge agent...")
+            logger.info("Reindexando documentos do knowledge agent...")
             try:
-                loader = self._DirectoryLoader(self.docs_dir, glob="**/*.*", show_progress=True)
-                docs = loader.load()
+                # Loaders explícitos por extensão. O padrão do DirectoryLoader
+                # (unstructured) é pesado e trava o processo no Windows.
+                docs = []
+                for pattern, loader_cls, loader_kwargs in [
+                    ("**/*.txt", self._TextLoader, {"encoding": "utf-8"}),
+                    ("**/*.md", self._TextLoader, {"encoding": "utf-8"}),
+                    ("**/*.pdf", self._PyPDFLoader, {}),
+                ]:
+                    loader = self._DirectoryLoader(
+                        self.docs_dir, glob=pattern, loader_cls=loader_cls, loader_kwargs=loader_kwargs
+                    )
+                    docs.extend(loader.load())
             except Exception as exc:
                 self.status_message = f"Erro ao carregar documentos: {exc}"
                 return None
@@ -158,7 +173,7 @@ class KnowledgeAgent:
                 self.status_message = f"Erro ao criar índice vetorial: {exc}"
                 return None
 
-        print("✅ Carregando índice vetorial existente...")
+        logger.info("Carregando índice vetorial existente...")
         try:
             return self._Chroma(
                 persist_directory=self.persist_dir,
