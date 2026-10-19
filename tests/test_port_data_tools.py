@@ -152,6 +152,65 @@ def test_yoy_em_toneladas_rotula_a_medida():
     assert "50.0%" in out
 
 
+# ------------------------------------------------------------------ #
+# YoY compara só os meses presentes nos dois anos
+# ------------------------------------------------------------------ #
+@pytest.fixture
+def store_mensal():
+    rows = [{"ano": 2025, "mes": m, "terminal": "BTP", "teu": 100} for m in range(1, 13)]
+    rows += [{"ano": 2026, "mes": m, "terminal": "BTP", "teu": 110 if m == 7 else 105} for m in range(1, 8)]
+    return make_store(rows)
+
+
+def test_yoy_mes_contra_mes(store_mensal):
+    # Janela jul/2025 a jul/2026: só julho existe nos dois anos.
+    out = pdt.query_port_data(store_mensal, start_date="2025-07", end_date="2026-07", compare_with_previous=True)
+    assert "mês(es) 7" in out
+    assert "10.0%" in out  # 100 -> 110, e não 100 -> soma de jan a jul de 2026
+
+
+def test_yoy_acumulado_do_ano(store_mensal):
+    out = pdt.query_port_data(store_mensal, start_date="2025", end_date="2026", compare_with_previous=True)
+    assert out.startswith("[YoY ACUMULADO/YTD: meses 1 a 7.")
+    assert "700" in out and "740" in out
+
+
+def test_yoy_sem_meses_em_comum():
+    rows = [{"ano": 2025, "mes": 12, "terminal": "BTP", "teu": 1}, {"ano": 2026, "mes": 1, "terminal": "BTP", "teu": 1}]
+    out = pdt.query_port_data(make_store(rows), compare_with_previous=True)
+    assert "não têm meses em comum" in out
+
+
+# ------------------------------------------------------------------ #
+# Resultado estruturado: formato brasileiro e procedência
+# ------------------------------------------------------------------ #
+def test_resultado_estruturado_e_formato_brasileiro():
+    rows = [{"ano": 2025, "mes": 1, "terminal": "SANTOS BRASIL", "teu": 2_595_312}, {"ano": 2025, "mes": 1, "terminal": "BTP", "teu": 1_977_127}]
+    result = pdt.run_query(make_store(rows), metric="market_share", start_date="2025-01-01", end_date="2025-12-31", group_by=["terminal"])
+
+    assert result.tipo == "share"
+    assert result.tabela["Share (%)"].tolist() == [56.76, 43.24]  # numérico, não texto
+    texto = result.texto("pt")
+    assert "2.595.312" in texto and "56,76%" in texto
+    assert "Terminal" in texto and "TERMINAL_SIGLA_CANONICA" not in texto
+    assert result.filtros["periodo"] == "01/2025 a 12/2025"
+    assert result.filtros["naturezas"] == ["CARGA CONTEINERIZADA"]
+
+
+def test_ano_nao_ganha_separador_de_milhar():
+    result = pdt.run_query(make_store([{"ano": 2025, "mes": 1, "terminal": "BTP", "teu": 1500}]), group_by=["ano"])
+    texto = result.texto("pt")
+    assert "2025" in texto and "2.025" not in texto
+    assert "1.500" in texto
+
+
+def test_aviso_e_resultado_sem_tabela(store):
+    result = pdt.run_query(store, terminals=["XYZ"])
+    assert result.tipo == "aviso"
+    assert result.tabela is None
+    assert "Nenhum dado encontrado" in result.texto("pt")
+
+
 def test_medida_invalida():
     with pytest.raises(ValueError, match="Medida inválida"):
         pdt.query_port_data(make_store([{"ano": 2025, "mes": 1, "terminal": "BTP", "teu": 1}]), medida="litros")
