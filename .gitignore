@@ -48,3 +48,5 @@ Thumbs.db
 .vscode/
 .idea/
 *.csv
+# Tabelas de referência versionadas (exceção ao *.csv acima)
+!reference/*.csv
