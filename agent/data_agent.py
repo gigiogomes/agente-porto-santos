@@ -101,7 +101,12 @@ class PortDataAgent:
                             "sentido": {
                                 "type": "array",
                                 "items": {"type": "string", "enum": ["EMBARQUE", "DESEMBARQUE"]},
-                                "description": "EMBARQUE = carga saindo por navio (exportação, no longo curso); DESEMBARQUE = carga chegando (importação).",
+                                "description": "EMBARQUE = carga saindo por navio; DESEMBARQUE = carga chegando. Exportação/importação também exigem navegacao=['LONGO CURSO'].",
+                            },
+                            "navegacao": {
+                                "type": "array",
+                                "items": {"type": "string", "enum": ["LONGO CURSO", "CABOTAGEM"]},
+                                "description": "LONGO CURSO = comércio exterior; CABOTAGEM = entre portos brasileiros.",
                             },
                             "start_date": {
                                 "type": "string",
@@ -301,7 +306,7 @@ class PortDataAgent:
         1. TEU e contêineres (unidades) existem só para carga conteinerizada; sem outro filtro, as métricas teus, conteineres, market_share e cagr consideram apenas contêineres.
         2. Perguntas em toneladas/peso, sobre granéis, carga geral, mercadorias (soja, açúcar, milho, combustíveis...) ou "movimentação total do porto": use metric="toneladas". Para share, CAGR ou comparação em peso, mantenha a métrica pedida e passe medida="toneladas".
         3. Mercadorias: use os nomes exatos da lista de mercadorias em `mercadorias`. Para "soja", prefira "SOJA EM GRAOS" e cite que farelo de soja é outra mercadoria, a menos que o usuário peça ambos.
-        4. Exportação/embarque de granel ou mercadoria -> sentido=["EMBARQUE"]; importação/desembarque -> sentido=["DESEMBARQUE"]. Cargo mix (cargo_mix_filter) só existe para contêineres.
+        4. Exportação de granel ou mercadoria -> sentido=["EMBARQUE"] e navegacao=["LONGO CURSO"]; importação -> sentido=["DESEMBARQUE"] e navegacao=["LONGO CURSO"] (cabotagem é transporte entre portos brasileiros, não comércio exterior). "Embarque"/"desembarque" sem falar em exportação/importação -> só sentido. Cargo mix (cargo_mix_filter) só existe para contêineres.
         5. Para quebrar por natureza, mercadoria, sentido ou tipo de navegação, use group_by com "natureza_carga", "mercadoria", "sentido" ou "navegacao".
         6. Se a resposta da ferramenta começar com "[Escopo: ...]", respeite e informe ao usuário a medida e os filtros ali descritos. Sempre diga a unidade (TEU, unidades ou toneladas).
 """

@@ -227,7 +227,7 @@ def _in_clause(column: str, values: List[str]) -> Tuple[str, list]:
 
 
 def _build_where(
-    start_date, end_date, naturezas, terminals, cargo_mix_filter, mercadorias, sentidos
+    start_date, end_date, naturezas, terminals, cargo_mix_filter, mercadorias, sentidos, navegacoes=None
 ) -> Tuple[List[str], list, List[str], list]:
     """
     Monta o WHERE em duas partes: o escopo (período + natureza), usado também
@@ -270,6 +270,10 @@ def _build_where(
         filter_params += params
     if sentidos:
         clause, params = _in_clause("sentido", [normalize_text(s) for s in sentidos])
+        filters.append(clause)
+        filter_params += params
+    if navegacoes:
+        clause, params = _in_clause("tipo_navegacao", [normalize_text(n) for n in navegacoes])
         filters.append(clause)
         filter_params += params
 
@@ -463,6 +467,7 @@ def query_port_data(
     natureza_carga: list = None,
     mercadorias: list = None,
     sentido: list = None,
+    navegacao: list = None,
 ) -> str:
     """Motor universal de agregação."""
     # 1. Medida e escopo. TEU e unidades de contêiner só fazem sentido para carga
@@ -492,13 +497,15 @@ def query_port_data(
         escopo.append(f"mercadorias={', '.join(mercadorias_resolvidas)}")
     if sentido:
         escopo.append(f"sentido={', '.join(sentido)}")
+    if navegacao:
+        escopo.append(f"navegacao={', '.join(navegacao)}")
     nota_escopo = f"[Escopo: medida={label}; {'; '.join(escopo)}]\n" if escopo else ""
 
     # 2. Filtragem e soma no DuckDB
     gb = [group_by] if isinstance(group_by, str) else (group_by or [])
     extra_dims = [OPTIONAL_DIMENSIONS[g] for g in gb if g in OPTIONAL_DIMENSIONS]
     scope, scope_params, filters, filter_params = _build_where(
-        start_date, end_date, naturezas, terminals, cargo_mix_filter, mercadorias_resolvidas, sentido
+        start_date, end_date, naturezas, terminals, cargo_mix_filter, mercadorias_resolvidas, sentido, navegacao
     )
     df_filtered = _reduce(store, scope + filters, scope_params + filter_params, extra_dims)
 

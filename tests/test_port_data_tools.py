@@ -131,6 +131,20 @@ def test_sentido_e_group_by_por_natureza(store_misto):
     assert "GRANEL SOLIDO" in linhas[2] and "80.0%" in linhas[2]
 
 
+def test_exportacao_e_so_longo_curso():
+    store = make_store(
+        [
+            {"ano": 2025, "mes": 1, "terminal": "ADM", "natureza": "GRANEL SOLIDO", "mercadoria": "SOJA EM GRÃOS", "ton": "1.000"},
+            {"ano": 2025, "mes": 1, "terminal": "ADM", "natureza": "GRANEL SOLIDO", "mercadoria": "SOJA EM GRÃOS", "ton": "40", "navegacao": "CABOTAGEM"},
+        ]
+    )
+    embarque = pdt.query_port_data(store, metric="toneladas", sentido=["EMBARQUE"])
+    exportacao = pdt.query_port_data(store, metric="toneladas", sentido=["EMBARQUE"], navegacao=["LONGO CURSO"])
+    assert embarque.split()[-1] == "1040"
+    assert exportacao.split()[-1] == "1000"
+    assert "navegacao=LONGO CURSO" in exportacao
+
+
 def test_yoy_em_toneladas_rotula_a_medida():
     rows = [{"ano": a, "mes": 1, "terminal": "ADM", "natureza": "GRANEL SOLIDO", "ton": t} for a, t in [(2024, "100"), (2025, "150")]]
     out = pdt.query_port_data(make_store(rows), metric="toneladas", compare_with_previous=True, group_by=["natureza_carga"])
